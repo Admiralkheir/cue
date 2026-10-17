@@ -7,15 +7,17 @@ pub enum ProviderKind {
     Anthropic,
     OpenAi,
     OpenCodeZen,
+    OpenCodeGo,
     Gemini,
     Ollama,
 }
 
 impl ProviderKind {
-    pub const ALL: [ProviderKind; 5] = [
+    pub const ALL: [ProviderKind; 6] = [
         ProviderKind::Anthropic,
         ProviderKind::OpenAi,
         ProviderKind::OpenCodeZen,
+        ProviderKind::OpenCodeGo,
         ProviderKind::Gemini,
         ProviderKind::Ollama,
     ];
@@ -25,8 +27,21 @@ impl ProviderKind {
             ProviderKind::Anthropic => "Anthropic (Claude)",
             ProviderKind::OpenAi => "OpenAI",
             ProviderKind::OpenCodeZen => "OpenCode Zen",
+            ProviderKind::OpenCodeGo => "OpenCode Go",
             ProviderKind::Gemini => "Google Gemini",
             ProviderKind::Ollama => "Ollama (local)",
+        }
+    }
+
+    /// Stable lowercase name, the same one the config file uses.
+    pub fn slug(self) -> &'static str {
+        match self {
+            ProviderKind::Anthropic => "anthropic",
+            ProviderKind::OpenAi => "open_ai",
+            ProviderKind::OpenCodeZen => "open_code_zen",
+            ProviderKind::OpenCodeGo => "open_code_go",
+            ProviderKind::Gemini => "gemini",
+            ProviderKind::Ollama => "ollama",
         }
     }
 
@@ -61,6 +76,8 @@ impl ProviderAccount {
 pub struct ModelInfo {
     pub id: String,
     pub display_name: Option<String>,
+    /// Whether the model accepts images, when the provider says.
+    pub vision: Option<bool>,
 }
 
 impl ModelInfo {
@@ -68,6 +85,7 @@ impl ModelInfo {
         Self {
             id: id.into(),
             display_name: None,
+            vision: None,
         }
     }
 }

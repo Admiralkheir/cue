@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     thread::sleep(Duration::from_secs(delay));
 
     let started = Instant::now();
-    let capture = cue_core::capture_focused_window(std::process::id())?;
+    let capture = cue_core::capture_focused_window(std::process::id(), None)?;
     let elapsed = started.elapsed();
 
     fs::write(&output, &capture.frame.jpeg)?;

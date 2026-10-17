@@ -91,9 +91,18 @@ impl fmt::Debug for EncodedFrame {
 }
 
 /// Captures the frontmost app's main window. Blocking; run it off the UI thread.
-pub fn capture_focused_window(own_pid: u32) -> Result<Capture, CaptureError> {
+///
+/// `frontmost_pid` is the frontmost app as the caller sees it. Pass it when you can:
+/// xcap's own focus check can be stale inside a long-running macOS app.
+pub fn capture_focused_window(
+    own_pid: u32,
+    frontmost_pid: Option<u32>,
+) -> Result<Capture, CaptureError> {
     let windows = Window::all()?;
-    let infos: Vec<WindowInfo> = windows.iter().map(window_info).collect();
+    let infos: Vec<WindowInfo> = windows
+        .iter()
+        .map(|window| window_info(window, frontmost_pid))
+        .collect();
     let target = &windows[choose_target(&infos, own_pid).ok_or(CaptureError::NoTarget)?];
 
     let image = target.capture_image()?;
@@ -107,10 +116,14 @@ pub fn capture_focused_window(own_pid: u32) -> Result<Capture, CaptureError> {
     })
 }
 
-fn window_info(window: &Window) -> WindowInfo {
+fn window_info(window: &Window, frontmost_pid: Option<u32>) -> WindowInfo {
+    let pid = window.pid().unwrap_or_default();
     WindowInfo {
-        pid: window.pid().unwrap_or_default(),
-        focused: window.is_focused().unwrap_or(false),
+        pid,
+        focused: match frontmost_pid {
+            Some(frontmost) => pid == frontmost,
+            None => window.is_focused().unwrap_or(false),
+        },
         minimized: window.is_minimized().unwrap_or(false),
         width: window.width().unwrap_or_default(),
         height: window.height().unwrap_or_default(),

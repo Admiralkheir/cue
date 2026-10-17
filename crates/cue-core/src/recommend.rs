@@ -24,12 +24,14 @@ pub struct AccountModels<'a> {
 /// Preferred model ids for a provider and tier, best first.
 fn preferences(kind: ProviderKind, tier: Tier) -> &'static [&'static str] {
     match (kind, tier) {
-        (ProviderKind::Anthropic | ProviderKind::OpenCodeZen, Tier::Fast) => {
-            &["claude-haiku-5-5", "claude-haiku-4-5"]
-        }
-        (ProviderKind::Anthropic | ProviderKind::OpenCodeZen, Tier::Deep) => {
-            &["claude-sonnet-5-5", "claude-sonnet-5", "claude-opus-5-5"]
-        }
+        (
+            ProviderKind::Anthropic | ProviderKind::OpenCodeZen | ProviderKind::OpenCodeGo,
+            Tier::Fast,
+        ) => &["claude-haiku-5-5", "claude-haiku-4-5"],
+        (
+            ProviderKind::Anthropic | ProviderKind::OpenCodeZen | ProviderKind::OpenCodeGo,
+            Tier::Deep,
+        ) => &["claude-sonnet-5-5", "claude-sonnet-5", "claude-opus-5-5"],
         // TODO: OpenAI, Gemini and Ollama preferences get added with their providers.
         _ => &[],
     }
@@ -50,7 +52,8 @@ pub fn recommend(tier: Tier, accounts: &[AccountModels<'_>]) -> Option<ModelRef>
                 entry
                     .models
                     .iter()
-                    .find(|model| id_matches(&model.id, preferred))
+                    // Cue always sends a screenshot.
+                    .find(|model| model.vision != Some(false) && id_matches(&model.id, preferred))
                     .map(|model| ModelRef {
                         account_id: entry.account.id.clone(),
                         model: model.id.clone(),
@@ -118,6 +121,22 @@ mod tests {
                 account_id: "z".into(),
                 model: "anthropic/claude-haiku-5-5".into()
             })
+        );
+    }
+
+    #[test]
+    fn skips_models_without_vision() {
+        let anthropic = account("a", ProviderKind::Anthropic);
+        let mut blind = ModelInfo::new("claude-haiku-5-5");
+        blind.vision = Some(false);
+        let listed = vec![blind, ModelInfo::new("claude-haiku-4-5")];
+        let accounts = [AccountModels {
+            account: &anthropic,
+            models: &listed,
+        }];
+        assert_eq!(
+            recommend(Tier::Fast, &accounts).map(|m| m.model).as_deref(),
+            Some("claude-haiku-4-5")
         );
     }
 
