@@ -23,6 +23,11 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3.2", features = ["NSResponder", "NSView", "NSWindow"] }
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
+global-hotkey = "0.8"
+xcap = "0.9.8"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+futures = "0.3"
+
 anyhow = "1"
 directories = "6"
 serde = { version = "1", features = ["derive"] }

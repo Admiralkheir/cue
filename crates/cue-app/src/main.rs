@@ -1,7 +1,9 @@
+mod hotkeys;
 mod overlay;
 mod platform;
 
 use cue_core::{Config, Tier};
+use futures::StreamExt;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::*;
 
@@ -81,12 +83,28 @@ fn load_config() -> (Config, Option<String>) {
 }
 
 fn main() {
-    let (config, error) = load_config();
+    let (config, mut error) = load_config();
 
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
 
         let overlay = overlay::open(cx).expect("failed to open the overlay");
+
+        match hotkeys::register(&config.hotkeys) {
+            Ok((manager, mut presses)) => {
+                cx.spawn(async move |cx| {
+                    // Dropping the manager would unregister the hotkeys.
+                    let _manager = manager;
+                    while let Some(tier) = presses.next().await {
+                        overlay
+                            .update(cx, |overlay, _, cx| overlay.ask(tier, cx))
+                            .ok();
+                    }
+                })
+                .detach();
+            }
+            Err(err) => error = error.or(Some(format!("Hotkeys disabled: {err:#}"))),
+        }
 
         let bounds = Bounds::centered(None, size(px(460.), px(300.)), cx);
         let options = WindowOptions {
