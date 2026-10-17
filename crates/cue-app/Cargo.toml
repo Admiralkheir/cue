@@ -1,0 +1,23 @@
+[package]
+name = "cue-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "cue"
+path = "src/main.rs"
+
+[features]
+default = ["runtime_shaders"]
+# Compiles Metal shaders at runtime so macOS builds work without a full Xcode install.
+# Release builds on a machine with Xcode can turn this off with --no-default-features.
+runtime_shaders = ["gpui_platform/runtime_shaders"]
+
+[dependencies]
+cue-core.workspace = true
+gpui-kit.workspace = true
+gpui_platform.workspace = true
+anyhow.workspace = true

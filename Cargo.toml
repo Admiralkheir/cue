@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/cue-core", "crates/cue-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Admiralkheir/cue"
+authors = ["Tugay Ersoy"]
+
+[workspace.dependencies]
+cue-core = { path = "crates/cue-core" }
+
+# gpui-kit re-exports gpui (the gpui-pre weekly Zed snapshot) plus gpui-component.
+# gpui_platform must stay on the exact gpui-pre version gpui-kit pins.
+gpui-kit = "0.7.3"
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9" }
+
+anyhow = "1"
+directories = "6"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "0.9"
+tempfile = "3"
