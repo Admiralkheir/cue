@@ -1,15 +1,12 @@
 //! The OpenAI-compatible Chat Completions format, which most gateways and open-model
 //! hosts speak.
 
-use std::io::{BufReader, Read};
 use std::ops::ControlFlow;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Value, json};
 
-use super::sse::Events;
-use super::{Completion, ProviderError, StopReason, Usage, http_agent, max_tokens};
+use super::http::{self, error_message};
+use super::{Completion, ProviderError, StopReason, Usage, max_tokens};
 use crate::capture::EncodedFrame;
 use crate::conversation::{Conversation, Role};
 use crate::recommend::Tier;
@@ -28,7 +25,7 @@ impl ChatCompletions {
         Self {
             endpoint,
             api_key,
-            agent: http_agent(),
+            agent: http::agent(),
             session_header: None,
         }
     }
@@ -55,18 +52,12 @@ impl ChatCompletions {
         let mut request = self
             .agent
             .post(&self.endpoint)
-            .header("authorization", &format!("Bearer {}", self.api_key))
-            .header("content-type", "application/json");
+            .header("authorization", &format!("Bearer {}", self.api_key));
         if let Some(name) = self.session_header {
             request = request.header(name, &conversation.id);
         }
-        let response = request.send(body.to_string()).map_err(network)?;
-        let status = response.status().as_u16();
-        let mut body = response.into_body();
-        if status != 200 {
-            return Err(http_error(status, &body.read_to_string().map_err(network)?));
-        }
-        read_stream(body.as_reader(), on_text)
+        let mut body = http::send_json(request, &body)?;
+        read_stream(&mut body, on_text)
     }
 }
 
@@ -89,30 +80,21 @@ fn messages(conversation: &Conversation) -> Vec<Value> {
 }
 
 fn image_part(frame: &EncodedFrame) -> Value {
-    let url = format!(
-        "data:{};base64,{}",
-        EncodedFrame::MEDIA_TYPE,
-        BASE64.encode(&frame.jpeg)
-    );
-    json!({ "type": "image_url", "image_url": { "url": url } })
+    json!({ "type": "image_url", "image_url": { "url": http::data_url(frame) } })
 }
 
 fn read_stream(
-    reader: impl Read,
+    body: &mut ureq::Body,
     on_text: &mut dyn FnMut(&str) -> ControlFlow<()>,
 ) -> Result<Completion, ProviderError> {
     let mut usage = Usage::default();
     let mut stop = None;
 
-    for event in Events::new(BufReader::new(reader)) {
-        let event = event.map_err(|err| ProviderError::Network(err.to_string()))?;
-        if event.data == "[DONE]" {
-            break;
-        }
-        let chunk: Value = serde_json::from_str(&event.data)
-            .map_err(|err| ProviderError::Protocol(err.to_string()))?;
+    for chunk in http::json_events(body) {
+        let Some(chunk) = chunk? else { break };
         if chunk.get("error").is_some() {
-            return Err(ProviderError::Api(error_message(&chunk)));
+            let message = error_message(&chunk).unwrap_or_else(|| "unknown error".into());
+            return Err(ProviderError::Api(message));
         }
         if let Some(prompt) = chunk["usage"]["prompt_tokens"].as_u64() {
             usage.input_tokens = prompt;
@@ -147,26 +129,6 @@ fn read_stream(
         stop: stop.unwrap_or(StopReason::EndTurn),
         usage,
     })
-}
-
-fn error_message(body: &Value) -> String {
-    let error = &body["error"];
-    error["message"]
-        .as_str()
-        .or_else(|| error.as_str())
-        .unwrap_or("unknown error")
-        .to_owned()
-}
-
-fn http_error(status: u16, body: &str) -> ProviderError {
-    let message = serde_json::from_str::<Value>(body)
-        .map(|body| error_message(&body))
-        .unwrap_or_else(|_| body.chars().take(200).collect());
-    ProviderError::Http { status, message }
-}
-
-fn network(err: ureq::Error) -> ProviderError {
-    ProviderError::Network(err.to_string())
 }
 
 #[cfg(test)]

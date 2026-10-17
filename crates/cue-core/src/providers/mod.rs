@@ -2,16 +2,26 @@
 
 mod anthropic;
 mod chat_completions;
+mod gemini;
+mod google;
+mod http;
 #[cfg(test)]
 mod mock;
+mod openai;
 mod opencode;
+mod responses;
 mod sse;
 
 use std::ops::ControlFlow;
 
 pub use anthropic::Anthropic;
 pub use chat_completions::ChatCompletions;
+pub use gemini::Gemini;
+pub use google::GoogleAi;
+pub use http::USER_AGENT;
+pub use openai::OpenAi;
 pub use opencode::{OpenCode, Plan};
+pub use responses::Responses;
 
 use crate::conversation::Conversation;
 use crate::provider::{ModelInfo, ProviderAccount, ProviderKind};
@@ -73,10 +83,8 @@ pub trait Provider: Send + Sync {
 
 /// Whether Cue has a client for this provider yet.
 pub fn is_supported(kind: ProviderKind) -> bool {
-    matches!(
-        kind,
-        ProviderKind::Anthropic | ProviderKind::OpenCodeZen | ProviderKind::OpenCodeGo
-    )
+    // Ollama is the one provider still to come.
+    !matches!(kind, ProviderKind::Ollama)
 }
 
 /// Builds the client for an account. `api_key` comes from the keychain.
@@ -93,6 +101,8 @@ pub fn connect(
     let base_url = account.base_url.as_deref();
     match account.kind {
         ProviderKind::Anthropic => Ok(Box::new(Anthropic::new(api_key, base_url))),
+        ProviderKind::OpenAi => Ok(Box::new(OpenAi::new(api_key, base_url))),
+        ProviderKind::Gemini => Ok(Box::new(GoogleAi::new(api_key, base_url))),
         ProviderKind::OpenCodeZen => Ok(Box::new(OpenCode::new(Plan::Zen, api_key, base_url))),
         ProviderKind::OpenCodeGo => Ok(Box::new(OpenCode::new(Plan::Go, api_key, base_url))),
         kind => Err(ProviderError::Unsupported(kind.display_name())),
@@ -105,19 +115,4 @@ fn max_tokens(tier: Tier) -> u32 {
         Tier::Fast => 4_096,
         Tier::Deep => 16_000,
     }
-}
-
-/// Sent with every request so providers can tell Cue's traffic apart.
-pub const USER_AGENT: &str = concat!("cue/", env!("CARGO_PKG_VERSION"));
-
-fn http_agent() -> ureq::Agent {
-    use std::time::Duration;
-    ureq::Agent::config_builder()
-        .user_agent(USER_AGENT)
-        // Read error bodies ourselves instead of getting a bare status code.
-        .http_status_as_error(false)
-        .timeout_connect(Some(Duration::from_secs(15)))
-        .timeout_recv_response(Some(Duration::from_secs(120)))
-        .build()
-        .into()
 }

@@ -477,9 +477,9 @@ impl Render for Settings {
                         "Cue only suggests models. Pick any model your keys can reach that accepts images.",
                     ))
                     .child(div().text_sm().child(format!("Fast — quick questions ({})", hotkeys.ask)))
-                    .child(Select::new(&self.fast_select).placeholder("Add a key to see models"))
+                    .child(Select::new(&self.fast_select).placeholder("Pick a model (add a key first if the list is empty)"))
                     .child(div().text_sm().child(format!("Deep — strategy ({})", hotkeys.ask_deep)))
-                    .child(Select::new(&self.deep_select).placeholder("Add a key to see models")),
+                    .child(Select::new(&self.deep_select).placeholder("Pick a model (add a key first if the list is empty)")),
             )
             .child(
                 section("Overlay")

@@ -1,16 +1,13 @@
 //! Claude through the Anthropic Messages API, over raw HTTP (there's no official Rust SDK).
 
 use std::collections::HashMap;
-use std::io::{BufReader, Read};
 use std::ops::ControlFlow;
 use std::sync::Mutex;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Value, json};
 
-use super::sse::Events;
-use super::{Completion, Provider, ProviderError, StopReason, Usage, http_agent, max_tokens};
+use super::http::{self, error_message};
+use super::{Completion, Provider, ProviderError, StopReason, Usage, max_tokens};
 use crate::capture::EncodedFrame;
 use crate::conversation::{Conversation, Role};
 use crate::provider::ModelInfo;
@@ -73,7 +70,7 @@ impl Anthropic {
                 .trim_end_matches('/')
                 .to_owned(),
             api_key,
-            agent: http_agent(),
+            agent: http::agent(),
             capabilities: Mutex::default(),
             session_header: None,
         }
@@ -85,19 +82,12 @@ impl Anthropic {
     }
 
     fn get(&self, path: &str) -> Result<Value, ProviderError> {
-        let response = self
-            .agent
-            .get(format!("{}{path}", self.base_url))
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", API_VERSION)
-            .call()
-            .map_err(network)?;
-        let status = response.status().as_u16();
-        let body = response.into_body().read_to_string().map_err(network)?;
-        if status != 200 {
-            return Err(http_error(status, &body));
-        }
-        serde_json::from_str(&body).map_err(|err| ProviderError::Protocol(err.to_string()))
+        http::get_json(
+            self.agent
+                .get(format!("{}{path}", self.base_url))
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", API_VERSION),
+        )
     }
 
     /// Looked up once per model; if the lookup fails we go by the model id.
@@ -158,7 +148,7 @@ fn image_block(frame: &EncodedFrame) -> Value {
         "source": {
             "type": "base64",
             "media_type": EncodedFrame::MEDIA_TYPE,
-            "data": BASE64.encode(&frame.jpeg),
+            "data": http::base64(frame),
         },
     })
 }
@@ -197,32 +187,24 @@ impl Provider for Anthropic {
             .agent
             .post(format!("{}/v1/messages", self.base_url))
             .header("x-api-key", &self.api_key)
-            .header("anthropic-version", API_VERSION)
-            .header("content-type", "application/json");
+            .header("anthropic-version", API_VERSION);
         if let Some(name) = self.session_header {
             request = request.header(name, &conversation.id);
         }
-        let response = request.send(body.to_string()).map_err(network)?;
-        let status = response.status().as_u16();
-        let mut body = response.into_body();
-        if status != 200 {
-            return Err(http_error(status, &body.read_to_string().map_err(network)?));
-        }
-        read_stream(body.as_reader(), on_text)
+        let mut body = http::send_json(request, &body)?;
+        read_stream(&mut body, on_text)
     }
 }
 
 fn read_stream(
-    reader: impl Read,
+    body: &mut ureq::Body,
     on_text: &mut dyn FnMut(&str) -> ControlFlow<()>,
 ) -> Result<Completion, ProviderError> {
     let mut usage = Usage::default();
     let mut stop = None;
 
-    for event in Events::new(BufReader::new(reader)) {
-        let event = event.map_err(|err| ProviderError::Network(err.to_string()))?;
-        let data: Value = serde_json::from_str(&event.data)
-            .map_err(|err| ProviderError::Protocol(err.to_string()))?;
+    for data in http::json_events(body) {
+        let Some(data) = data? else { break };
         match data["type"].as_str() {
             Some("message_start") => {
                 usage.input_tokens = data["message"]["usage"]["input_tokens"]
@@ -255,7 +237,10 @@ fn read_stream(
                         other => StopReason::Other(other.to_owned()),
                     });
             }
-            Some("error") => return Err(ProviderError::Api(error_message(&data))),
+            Some("error") => {
+                let message = error_message(&data).unwrap_or_else(|| "unknown error".into());
+                return Err(ProviderError::Api(message));
+            }
             Some("message_stop") => break,
             // Thinking blocks, pings and block boundaries carry nothing we show.
             _ => {}
@@ -264,24 +249,6 @@ fn read_stream(
 
     stop.map(|stop| Completion { stop, usage })
         .ok_or_else(|| ProviderError::Protocol("the stream ended without a stop reason".into()))
-}
-
-fn error_message(body: &Value) -> String {
-    body["error"]["message"]
-        .as_str()
-        .unwrap_or("unknown error")
-        .to_owned()
-}
-
-fn http_error(status: u16, body: &str) -> ProviderError {
-    let message = serde_json::from_str::<Value>(body)
-        .map(|body| error_message(&body))
-        .unwrap_or_else(|_| body.chars().take(200).collect());
-    ProviderError::Http { status, message }
-}
-
-fn network(err: ureq::Error) -> ProviderError {
-    ProviderError::Network(err.to_string())
 }
 
 #[cfg(test)]
@@ -357,7 +324,10 @@ mod tests {
         assert_eq!(request.path, "/v1/models?limit=1000");
         assert_eq!(request.header("x-api-key"), Some("sk-test"));
         assert_eq!(request.header("anthropic-version"), Some(API_VERSION));
-        assert_eq!(request.header("user-agent"), Some(super::super::USER_AGENT));
+        assert_eq!(
+            request.header("user-agent"),
+            Some(crate::providers::USER_AGENT)
+        );
     }
 
     #[test]
@@ -403,8 +373,8 @@ mod tests {
             "image/jpeg"
         );
         assert_eq!(
-            messages[0]["content"][0]["source"]["data"],
-            BASE64.encode([0xFF, 0xD8, 0xFF])
+            messages[0]["content"][0]["source"]["data"], "/9j/",
+            "base64 of the JPEG bytes"
         );
         assert_eq!(messages[0]["content"][1]["text"], "where now?");
         assert_eq!(
