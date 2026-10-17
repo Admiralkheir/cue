@@ -17,6 +17,12 @@ cue-core = { path = "crates/cue-core" }
 gpui-kit = "0.7.3"
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9" }
 
+raw-window-handle = { version = "0.6", features = ["std"] }
+# Native window tweaks GPUI doesn't expose; versions match what gpui-pre already pulls in.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", features = ["NSResponder", "NSView", "NSWindow"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
 anyhow = "1"
 directories = "6"
 serde = { version = "1", features = ["derive"] }
