@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
-use cue_core::providers::{self, Completion, StopReason};
+use cue_core::providers::{self, Completion, ProviderError, StopReason};
 use cue_core::{
     Capture, Conversation, ProviderAccount, Role, Tier, capture_focused_window, secrets,
 };
@@ -234,9 +234,11 @@ impl Overlay {
         cx.notify();
 
         let (deltas_tx, mut deltas) = mpsc::unbounded::<String>();
+        // Shown under the answer, so it's clear which key paid for it.
+        let label = format!("{model} · {}", account.display_name());
         let request = cx.background_spawn(async move {
             request_answer(&account, &model, tier, &conversation, &cancel, &deltas_tx)
-                .map(|completion| (model, completion))
+                .map(|completion| (label, completion))
         });
         cx.spawn_in(window, async move |this, cx| {
             while let Some(piece) = deltas.next().await {
@@ -282,7 +284,7 @@ impl Overlay {
         };
 
         let completion = match result {
-            Ok((model, completion)) => Some((model, completion)),
+            Ok((label, completion)) => Some((label, completion)),
             Err(message) => {
                 session.note = Some(Note::Error(message));
                 None
@@ -302,10 +304,10 @@ impl Overlay {
         let Some(session) = self.session_mut(id) else {
             return;
         };
-        if let Some((model, Completion { stop, usage })) = completion {
+        if let Some((label, Completion { stop, usage })) = completion {
             session.note = match stop {
                 StopReason::EndTurn => Some(Note::Info(format!(
-                    "{model} · {} in / {} out tokens",
+                    "{label} · {} in / {} out tokens",
                     usage.input_tokens, usage.output_tokens
                 ))),
                 StopReason::MaxTokens => {
@@ -508,8 +510,25 @@ fn request_answer(
     cancel: &AtomicBool,
     deltas: &mpsc::UnboundedSender<String>,
 ) -> Result<Completion, String> {
-    let key = secrets::api_key(&account.id).map_err(|err| err.to_string())?;
-    let provider = providers::connect(account, key).map_err(|err| err.to_string())?;
+    let name = account.display_name();
+    let describe = |err: ProviderError| {
+        let rejected_key = matches!(
+            err,
+            ProviderError::MissingKey
+                | ProviderError::Http {
+                    status: 401 | 403,
+                    ..
+                }
+        );
+        let hint = if rejected_key {
+            " Check this key, or pick a model from another key in Cue's settings."
+        } else {
+            ""
+        };
+        format!("{name}: {err}{hint}")
+    };
+    let key = secrets::api_key(&account.id).map_err(|err| format!("{name}: {err}"))?;
+    let provider = providers::connect(account, key).map_err(describe)?;
     provider
         .stream(model, tier, conversation, &mut |piece| {
             let stopped =
@@ -520,7 +539,7 @@ fn request_answer(
                 ControlFlow::Continue(())
             }
         })
-        .map_err(|err| err.to_string())
+        .map_err(describe)
 }
 
 /// A handle to the overlay window and its view.
