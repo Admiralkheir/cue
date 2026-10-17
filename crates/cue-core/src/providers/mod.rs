@@ -1,6 +1,7 @@
 //! Clients for the AI providers. Calls block, so run them off the UI thread.
 
 mod anthropic;
+mod chat_completions;
 #[cfg(test)]
 mod mock;
 mod opencode;
@@ -9,6 +10,7 @@ mod sse;
 use std::ops::ControlFlow;
 
 pub use anthropic::Anthropic;
+pub use chat_completions::ChatCompletions;
 pub use opencode::{OpenCode, Plan};
 
 use crate::conversation::Conversation;

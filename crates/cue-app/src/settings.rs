@@ -324,6 +324,18 @@ impl Settings {
         self.refresh_selects(window, cx);
     }
 
+    fn show_overlay(&mut self, cx: &mut Context<Self>) {
+        if let Err(err) = self
+            .overlay
+            .update(cx, |overlay, window, cx| overlay.show(window, cx))
+        {
+            self.message = Some(Message::Error(format!(
+                "Couldn't show the overlay: {err:#}"
+            )));
+            cx.notify();
+        }
+    }
+
     fn toggle_click_through(&mut self, cx: &mut Context<Self>) {
         let result = self.overlay.update(cx, |overlay, window, cx| {
             let enabled = !overlay.click_through();
@@ -470,16 +482,28 @@ impl Render for Settings {
                     .child(Select::new(&self.deep_select).placeholder("Add a key to see models")),
             )
             .child(
-                section("Overlay").child(
-                    Button::new("toggle-click-through")
-                        .outline()
-                        .label(if click_through {
-                            "Clicks pass through the overlay (click to make it interactive)"
-                        } else {
-                            "The overlay takes clicks (click to pass them through)"
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_click_through(cx))),
-                ),
+                section("Overlay")
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+                        "Esc hides the overlay. {} or {} captures the game and brings it back; \
+                         this button brings back the last conversation without a new capture.",
+                        hotkeys.ask, hotkeys.ask_deep
+                    )))
+                    .child(
+                        Button::new("show-overlay")
+                            .primary()
+                            .label("Show overlay")
+                            .on_click(cx.listener(|this, _, _, cx| this.show_overlay(cx))),
+                    )
+                    .child(
+                        Button::new("toggle-click-through")
+                            .outline()
+                            .label(if click_through {
+                                "Clicks pass through the overlay (click to make it interactive)"
+                            } else {
+                                "The overlay takes clicks (click to pass them through)"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_click_through(cx))),
+                    ),
             )
     }
 }

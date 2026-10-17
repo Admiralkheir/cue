@@ -1,13 +1,14 @@
 //! OpenCode Zen and OpenCode Go: one key for many vendors' models. OpenCode serves each
 //! model in its vendor's API format, so requests are routed per model.
 //!
-//! Only models served in the Anthropic Messages format are wired up so far.
+//! The Anthropic Messages and Chat Completions formats are wired up; models served in
+//! the OpenAI Responses or Gemini formats aren't yet.
 
 use std::ops::ControlFlow;
 
 use serde_json::Value;
 
-use super::{Anthropic, Completion, Provider, ProviderError, http_agent};
+use super::{Anthropic, ChatCompletions, Completion, Provider, ProviderError, http_agent};
 use crate::conversation::Conversation;
 use crate::provider::ModelInfo;
 use crate::recommend::Tier;
@@ -43,9 +44,26 @@ impl Plan {
         }
     }
 
-    fn speaks_anthropic(self, model: &str) -> bool {
-        model.starts_with("claude-") || self.anthropic_format_models().contains(&model)
+    fn format(self, model: &str) -> Format {
+        // Served in the OpenAI Responses or Gemini format, or not a chat model at all (Jev).
+        const NOT_YET: &[&str] = &["gpt-", "grok-", "muse-", "gemini-", "jev-"];
+        if model.starts_with("claude-") || self.anthropic_format_models().contains(&model) {
+            Format::Anthropic
+        } else if NOT_YET.iter().any(|prefix| model.starts_with(prefix)) {
+            Format::Unsupported
+        } else {
+            // OpenCode's catch-all endpoint, used by most open models.
+            Format::ChatCompletions
+        }
     }
+}
+
+/// The API format OpenCode serves a model in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Anthropic,
+    ChatCompletions,
+    Unsupported,
 }
 
 pub struct OpenCode {
@@ -54,6 +72,7 @@ pub struct OpenCode {
     api_key: String,
     agent: ureq::Agent,
     anthropic: Anthropic,
+    chat: ChatCompletions,
 }
 
 impl OpenCode {
@@ -67,6 +86,11 @@ impl OpenCode {
             // OpenCode asks clients to send a stable id per conversation.
             anthropic: Anthropic::new(api_key.clone(), Some(&format!("{base_url}/anthropic")))
                 .with_session_header("x-opencode-session"),
+            chat: ChatCompletions::new(
+                format!("{base_url}/openai/v1/chat/completions"),
+                api_key.clone(),
+            )
+            .with_session_header("x-opencode-session"),
             base_url,
             api_key,
             agent: http_agent(),
@@ -103,12 +127,13 @@ impl Provider for OpenCode {
             .iter()
             .filter_map(|model| model["id"].as_str())
             // Models in other API formats can't be called yet, so don't offer them.
-            .filter(|id| self.plan.speaks_anthropic(id))
+            .filter(|id| self.plan.format(id) != Format::Unsupported)
             .map(|id| ModelInfo {
                 id: id.to_owned(),
                 display_name: None,
-                // OpenCode's list has no capability data; every Claude model takes images.
-                vision: id.starts_with("claude-").then_some(true),
+                // OpenCode's list has no capability data. Every Claude model takes images,
+                // and "-vl" (vision-language) in a name means it does too.
+                vision: (id.starts_with("claude-") || id.contains("-vl")).then_some(true),
             })
             .collect())
     }
@@ -120,10 +145,11 @@ impl Provider for OpenCode {
         conversation: &Conversation,
         on_text: &mut dyn FnMut(&str) -> ControlFlow<()>,
     ) -> Result<Completion, ProviderError> {
-        if !self.plan.speaks_anthropic(model) {
-            return Err(ProviderError::Unsupported("this OpenCode model"));
+        match self.plan.format(model) {
+            Format::Anthropic => self.anthropic.stream(model, tier, conversation, on_text),
+            Format::ChatCompletions => self.chat.stream(model, tier, conversation, on_text),
+            Format::Unsupported => Err(ProviderError::Unsupported("this OpenCode model")),
         }
-        self.anthropic.stream(model, tier, conversation, on_text)
     }
 }
 
@@ -139,15 +165,24 @@ mod tests {
     fn lists_only_models_it_can_call() {
         let server = MockServer::start(vec![Reply::json(
             200,
-            r#"{"object":"list","data":[{"id":"claude-haiku-5-5"},{"id":"glm-5.3"},{"id":"minimax-m3"},{"id":"gpt-6-luna"}]}"#,
+            r#"{"object":"list","data":[{"id":"claude-haiku-5-5"},{"id":"glm-5.3"},{"id":"minimax-m3"},
+                {"id":"gpt-6-luna"},{"id":"gemini-4-argon"},{"id":"nemotron-3.5-super-vl-free"}]}"#,
         )]);
         let client = OpenCode::new(Plan::Go, "oc-test".into(), Some(&server.url));
 
         let models = client.list_models().unwrap();
         let ids: Vec<_> = models.iter().map(|model| model.id.as_str()).collect();
-        assert_eq!(ids, ["claude-haiku-5-5", "minimax-m3"]);
-        assert_eq!(models[0].vision, Some(true));
-        assert_eq!(models[1].vision, None);
+        assert_eq!(
+            ids,
+            [
+                "claude-haiku-5-5",
+                "glm-5.3",
+                "minimax-m3",
+                "nemotron-3.5-super-vl-free"
+            ]
+        );
+        let vision: Vec<_> = models.iter().map(|model| model.vision).collect();
+        assert_eq!(vision, [Some(true), None, None, Some(true)]);
 
         let request = &server.requests()[0];
         assert_eq!(request.path, "/v1/models");
@@ -211,6 +246,43 @@ mod tests {
         );
         let body: Value = serde_json::from_str(&requests[1].body).unwrap();
         assert_eq!(body["output_config"]["effort"], "low");
+    }
+
+    #[test]
+    fn sends_open_models_through_chat_completions() {
+        let server = MockServer::start(vec![Reply::new(
+            200,
+            "text/event-stream",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )]);
+        let client = OpenCode::new(Plan::Zen, "oc-test".into(), Some(&server.url));
+        let conversation = Conversation {
+            id: "conversation-1".into(),
+            system: String::new(),
+            image: None,
+            turns: vec![Turn {
+                role: Role::User,
+                text: "hello".into(),
+            }],
+        };
+
+        let mut text = String::new();
+        client
+            .stream(
+                "nemotron-3.5-super-vl-free",
+                Tier::Fast,
+                &conversation,
+                &mut |piece| {
+                    text.push_str(piece);
+                    ControlFlow::Continue(())
+                },
+            )
+            .unwrap();
+        assert_eq!(text, "ok");
+        let request = &server.requests()[0];
+        assert_eq!(request.path, "/openai/v1/chat/completions");
+        assert_eq!(request.header("authorization"), Some("Bearer oc-test"));
+        assert_eq!(request.header("x-opencode-session"), Some("conversation-1"));
     }
 
     #[test]

@@ -65,6 +65,17 @@ pub fn has_keyboard(window: &Window) -> bool {
     }
 }
 
+/// Shows the window without taking the keyboard from the app in front.
+pub fn show(window: &Window) -> Result<()> {
+    match raw_handle(window)? {
+        #[cfg(target_os = "macos")]
+        RawWindowHandle::AppKit(handle) => macos::show(handle),
+        #[cfg(target_os = "windows")]
+        RawWindowHandle::Win32(handle) => win32::show(handle),
+        other => bail!("showing isn't supported for {other:?}"),
+    }
+}
+
 /// Hides the window and hands the keyboard back to the app that had it (the game).
 pub fn hide(window: &Window) -> Result<()> {
     match raw_handle(window)? {
@@ -156,6 +167,11 @@ mod macos {
         u32::try_from(app.processIdentifier()).ok()
     }
 
+    pub fn show(handle: AppKitWindowHandle) -> Result<()> {
+        ns_window(handle)?.orderFrontRegardless();
+        Ok(())
+    }
+
     pub fn hide(handle: AppKitWindowHandle) -> Result<()> {
         ns_window(handle)?.orderOut(None);
         if let Some(app) = PREVIOUS_APP.with_borrow_mut(Option::take) {
@@ -172,8 +188,8 @@ mod win32 {
     use windows::Win32::Foundation::{COLORREF, HWND};
     use windows::Win32::UI::WindowsAndMessaging::{
         GWL_EXSTYLE, GetForegroundWindow, GetWindowLongPtrW, LWA_ALPHA, SW_HIDE, SW_SHOW,
-        SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, ShowWindow,
-        WS_EX_LAYERED, WS_EX_TRANSPARENT,
+        SW_SHOWNOACTIVATE, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW,
+        ShowWindow, WS_EX_LAYERED, WS_EX_TRANSPARENT,
     };
 
     fn hwnd(handle: Win32WindowHandle) -> HWND {
@@ -214,6 +230,14 @@ mod win32 {
     pub fn has_keyboard(handle: Win32WindowHandle) -> bool {
         // SAFETY: no preconditions.
         unsafe { GetForegroundWindow() == hwnd(handle) }
+    }
+
+    pub fn show(handle: Win32WindowHandle) -> Result<()> {
+        // SAFETY: as above.
+        unsafe {
+            let _ = ShowWindow(hwnd(handle), SW_SHOWNOACTIVATE);
+        }
+        Ok(())
     }
 
     pub fn hide(handle: Win32WindowHandle) -> Result<()> {

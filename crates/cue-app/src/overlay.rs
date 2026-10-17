@@ -322,6 +322,21 @@ impl Overlay {
         cx.notify();
     }
 
+    /// Brings the overlay back without a new capture. With a capture on hand it takes the
+    /// keyboard, so the conversation can go on; otherwise it just shows the hint.
+    pub fn show(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let shown = if matches!(self.status, Status::Session(_)) {
+            platform::show_and_focus(window)
+                .and_then(|()| self.set_click_through(false, window, cx))
+                .map(|()| self.input.update(cx, |input, cx| input.focus(window, cx)))
+        } else {
+            platform::show(window)
+        };
+        if let Err(err) = shown {
+            eprintln!("cue: couldn't show the overlay: {err:#}");
+        }
+    }
+
     /// Hides the overlay and hands the keyboard back to the game.
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let hidden = platform::hide(window).and_then(|()| self.set_click_through(true, window, cx));
