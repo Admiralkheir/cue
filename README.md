@@ -1,5 +1,7 @@
 # Cue
 
+[![CI](https://github.com/Admiralkheir/cue/actions/workflows/ci.yml/badge.svg)](https://github.com/Admiralkheir/cue/actions/workflows/ci.yml)
+
 An open-source, AI-powered game assistant. Press a hotkey while you play, Cue grabs the
 game window, and you ask your question: "how do I solve this puzzle?", "what's the best
 way to deal with this boss?". The answer streams into a translucent overlay on top of
@@ -48,13 +50,14 @@ Xcode Command Line Tools are enough. With full Xcode installed you can precompil
 cargo build -p cue-app --release --no-default-features
 ```
 
-### Layout
+## Contributing
 
-| Crate | Purpose |
-| --- | --- |
-| `crates/cue-core` | UI-independent core: config, capture, provider clients, key storage, model recommendations |
-| `crates/cue-app` | The GPUI desktop app (`cue` binary) |
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the ground rules, the checks CI runs and some
+development shortcuts.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). Cue builds on many open-source crates; their licenses are collected with
+[cargo-about](https://github.com/EmbarkStudios/cargo-about) (`cargo about generate
+about.hbs --output-file THIRD_PARTY_LICENSES.html`), and CI publishes the result as an
+artifact.
