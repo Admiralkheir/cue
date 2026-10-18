@@ -5,6 +5,10 @@
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc"]
 
 [advisories]
+# Vulnerabilities always fail. "Unmaintained" notices only fail for crates Cue depends on
+# directly; as of October 2026 GPUI and gpui-kit pull in instant, paste, rustybuzz and
+# ttf-parser, which have no maintained upgrade yet.
+unmaintained = "workspace"
 ignore = []
 
 [licenses]

@@ -8,6 +8,8 @@ edition = "2024"
 license = "MIT"
 repository = "https://github.com/Admiralkheir/cue"
 authors = ["Tugay Ersoy"]
+# Shipped as an app, not as crates on crates.io.
+publish = false
 
 [workspace.dependencies]
 cue-core = { path = "crates/cue-core" }
