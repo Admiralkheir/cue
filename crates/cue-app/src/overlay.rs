@@ -8,7 +8,8 @@ use std::time::Duration;
 use anyhow::Result;
 use cue_core::providers::{self, Completion, ProviderError, StopReason};
 use cue_core::{
-    Capture, Conversation, ProviderAccount, Role, Tier, capture_focused_window, secrets,
+    Capture, Conversation, OverlayPosition, ProviderAccount, Role, Tier, capture_focused_window,
+    secrets,
 };
 use futures::StreamExt;
 use futures::channel::mpsc;
@@ -18,18 +19,16 @@ use gpui_kit::component::text::TextView;
 use gpui_kit::*;
 
 use crate::app_state::AppState;
-use crate::game_editor;
-use crate::platform;
+use crate::themes::{self, OverlayTheme};
+use crate::{game_editor, hotkeys, platform};
 
 const SIZE: Size<Pixels> = Size {
     width: px(420.),
     height: px(600.),
 };
 const MARGIN: Pixels = px(24.);
-const TEXT: u32 = 0xe8eaed;
-const MUTED: u32 = 0x9aa0a6;
-const ERROR: u32 = 0xf28b82;
-const LINK: u32 = 0x8ab4f8;
+/// How long the overlay has to sit still after a drag before its position is saved.
+const SAVE_POSITION_AFTER: Duration = Duration::from_millis(500);
 
 enum Status {
     Idle,
@@ -66,6 +65,8 @@ pub struct Overlay {
     next_session_id: u64,
     input: Entity<InputState>,
     scroll: ScrollHandle,
+    /// Bumped on every move, so only the last move of a drag gets saved.
+    position_saves: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -78,14 +79,46 @@ impl Overlay {
                     this.submit(window, cx);
                 }
             });
+        let on_move = cx.observe_window_bounds(window, |this, window, cx| {
+            this.save_position_later(window, cx)
+        });
         Self {
             click_through: true,
             status: Status::Idle,
             next_session_id: 0,
             input,
             scroll: ScrollHandle::new(),
-            _subscriptions: vec![on_enter],
+            position_saves: 0,
+            _subscriptions: vec![on_enter, on_move],
         }
+    }
+
+    /// Remembers where the player dragged the overlay, once it has stopped moving.
+    fn save_position_later(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.position_saves += 1;
+        let save = self.position_saves;
+        let origin = window.bounds().origin;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SAVE_POSITION_AFTER).await;
+            this.update(cx, |this, cx| {
+                if this.position_saves != save {
+                    return;
+                }
+                let state = cx.global_mut::<AppState>();
+                let position = OverlayPosition {
+                    x: f32::from(origin.x),
+                    y: f32::from(origin.y),
+                };
+                if state.config.overlay.position == Some(position) {
+                    return;
+                }
+                state.config.overlay.position = Some(position);
+                if let Err(err) = state.save() {
+                    eprintln!("cue: couldn't save the overlay position: {err:#}");
+                }
+            })
+        })
+        .detach();
     }
 
     pub fn click_through(&self) -> bool {
@@ -358,7 +391,12 @@ impl Overlay {
         }
     }
 
-    fn render_session(&self, session: &Session, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_session(
+        &self,
+        session: &Session,
+        theme: &OverlayTheme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let capture = &session.capture;
         let game = cx
             .global::<AppState>()
@@ -386,7 +424,7 @@ impl Overlay {
             .map(|(index, turn)| match turn.role {
                 Role::User => div()
                     .text_sm()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(theme.muted))
                     .child(format!("› {}", turn.text))
                     .into_any_element(),
                 Role::Assistant => {
@@ -397,7 +435,7 @@ impl Overlay {
             if pending.text.is_empty() {
                 div()
                     .text_sm()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(theme.muted))
                     .child("Thinking…")
                     .into_any_element()
             } else {
@@ -427,7 +465,7 @@ impl Overlay {
                             .flex_col()
                             .min_w_0()
                             .child(div().text_sm().truncate().child(title))
-                            .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+                            .child(div().text_xs().text_color(rgb(theme.muted)).child(format!(
                                 "{}×{} · {} KB",
                                 capture.frame.width,
                                 capture.frame.height,
@@ -437,7 +475,7 @@ impl Overlay {
                                 div()
                                     .id("game-notes")
                                     .text_xs()
-                                    .text_color(rgb(LINK))
+                                    .text_color(rgb(theme.accent))
                                     .cursor_pointer()
                                     .hover(|style| style.underline())
                                     .child(notes_label)
@@ -459,9 +497,17 @@ impl Overlay {
                     .children(turns)
                     .children(pending),
             )
-            .children(session.note.as_ref().map(|note| match note {
-                Note::Info(text) => div().text_xs().text_color(rgb(MUTED)).child(text.clone()),
-                Note::Error(text) => div().text_xs().text_color(rgb(ERROR)).child(text.clone()),
+            .children(session.note.as_ref().map(|note| {
+                match note {
+                    Note::Info(text) => div()
+                        .text_xs()
+                        .text_color(rgb(theme.muted))
+                        .child(text.clone()),
+                    Note::Error(text) => div()
+                        .text_xs()
+                        .text_color(rgb(theme.error))
+                        .child(text.clone()),
+                }
             }))
             .child(Input::new(&self.input))
     }
@@ -469,7 +515,13 @@ impl Overlay {
 
 impl Render for Overlay {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let hotkeys = &cx.global::<AppState>().config.hotkeys;
+        let config = &cx.global::<AppState>().config;
+        let theme = themes::find(&config.overlay.theme);
+        let opacity = config.overlay.opacity();
+        let (ask, ask_deep) = (
+            hotkeys::pretty(&config.hotkeys.ask),
+            hotkeys::pretty(&config.hotkeys.ask_deep),
+        );
         let tier = match &self.status {
             Status::Capturing(tier) => Some(*tier),
             Status::Session(session) => Some(session.tier),
@@ -484,21 +536,20 @@ impl Render for Overlay {
             Status::Idle => div()
                 .text_sm()
                 .child(format!(
-                    "Press {} to ask about what's on screen, or {} for a deeper answer.",
-                    hotkeys.ask, hotkeys.ask_deep
+                    "Press {ask} to ask about what's on screen, or {ask_deep} for a deeper answer."
                 ))
                 .into_any_element(),
             Status::Capturing(_) => div()
                 .text_sm()
-                .text_color(rgb(MUTED))
+                .text_color(rgb(theme.muted))
                 .child("Capturing…")
                 .into_any_element(),
             Status::Failed(message) => div()
                 .text_sm()
-                .text_color(rgb(ERROR))
+                .text_color(rgb(theme.error))
                 .child(message.clone())
                 .into_any_element(),
-            Status::Session(session) => self.render_session(session, cx).into_any_element(),
+            Status::Session(session) => self.render_session(session, theme, cx).into_any_element(),
         };
 
         // The window is transparent; only this rounded panel is drawn.
@@ -519,18 +570,29 @@ impl Render for Overlay {
                     .gap_3()
                     .p_4()
                     .rounded_xl()
-                    .bg(rgba(0x101218e8))
+                    .bg(theme.background(opacity))
                     .border_1()
-                    .border_color(rgba(0xffffff26))
+                    .border_color(theme.border())
                     .shadow_lg()
-                    .text_color(rgb(TEXT))
+                    .text_color(rgb(theme.text))
                     .child(
+                        // The header is the drag handle.
                         div()
+                            .id("drag-handle")
                             .flex()
                             .justify_between()
                             .items_center()
+                            .cursor_grab()
+                            .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                platform::start_drag(window)
+                            })
                             .child(div().font_weight(FontWeight::SEMIBOLD).child("Cue"))
-                            .child(div().text_xs().text_color(rgb(MUTED)).child(header_hint)),
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme.muted))
+                                    .child(header_hint),
+                            ),
                     )
                     .child(body),
             )
@@ -602,14 +664,29 @@ impl OverlayHandle {
     }
 }
 
-/// Opens the overlay in the top-right corner of the primary display without taking
-/// focus away from the game. While idle it lets clicks through to the game.
+/// Opens the overlay where the player last left it, or in the top-right corner of the
+/// primary display, without taking focus away from the game. While idle it lets clicks
+/// through to the game.
 pub fn open(cx: &mut App) -> Result<OverlayHandle> {
-    let screen = cx
-        .primary_display()
-        .map(|display| display.visible_bounds())
-        .unwrap_or_else(|| Bounds::new(Point::default(), size(px(1280.), px(800.))));
-    let origin = point(screen.right() - SIZE.width - MARGIN, screen.top() + MARGIN);
+    let saved = cx
+        .global::<AppState>()
+        .config
+        .overlay
+        .position
+        .map(|position| point(px(position.x), px(position.y)))
+        // A display may have been unplugged since.
+        .filter(|origin| {
+            cx.displays()
+                .iter()
+                .any(|display| display.bounds().contains(origin))
+        });
+    let origin = saved.unwrap_or_else(|| {
+        let screen = cx
+            .primary_display()
+            .map(|display| display.visible_bounds())
+            .unwrap_or_else(|| Bounds::new(Point::default(), size(px(1280.), px(800.))));
+        point(screen.right() - SIZE.width - MARGIN, screen.top() + MARGIN)
+    });
 
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::new(origin, SIZE))),

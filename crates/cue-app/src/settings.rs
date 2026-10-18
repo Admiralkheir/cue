@@ -1,20 +1,25 @@
 //! The settings window: provider keys, model picks for each tier, game profiles, overlay.
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cue_core::providers;
-use cue_core::{ModelInfo, ProviderAccount, ProviderKind, Tier, recommend, secrets};
+use cue_core::{
+    Hotkeys, ModelInfo, OverlaySettings, ProviderAccount, ProviderKind, Tier, recommend, secrets,
+};
 use gpui_kit::component::Disableable;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::select::{Select, SelectEvent};
+use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::*;
 
 use crate::app_state::AppState;
 use crate::game_editor;
+use crate::hotkeys::{self, HotkeyService};
 use crate::model_picker::{self, ModelChoice, ModelSelect};
 use crate::overlay::OverlayHandle;
+use crate::themes::{self, THEMES};
 
 const MUTED: u32 = 0x9aa0a6;
 const ERROR: u32 = 0xf28b82;
@@ -39,6 +44,11 @@ pub struct Settings {
     model_status: HashMap<String, ModelStatus>,
     fast_select: ModelSelect,
     deep_select: ModelSelect,
+    opacity: Entity<SliderState>,
+    ask_input: Entity<InputState>,
+    ask_deep_input: Entity<InputState>,
+    /// Bumped on every slider move, so a drag saves the config once, at the end.
+    pending_saves: u64,
     message: Option<Message>,
     _subscriptions: Vec<Subscription>,
 }
@@ -52,6 +62,18 @@ impl Settings {
         });
         let fast_select = model_picker::new_select(window, cx);
         let deep_select = model_picker::new_select(window, cx);
+        let config = cx.global::<AppState>().config.clone();
+        let opacity = cx.new(|_| {
+            SliderState::new()
+                .min(OverlaySettings::MIN_OPACITY)
+                .max(1.0)
+                .step(0.05)
+                .default_value(config.overlay.opacity())
+        });
+        let ask_input =
+            cx.new(|cx| InputState::new(window, cx).default_value(config.hotkeys.ask.clone()));
+        let ask_deep_input =
+            cx.new(|cx| InputState::new(window, cx).default_value(config.hotkeys.ask_deep.clone()));
         let subscriptions = vec![
             cx.subscribe_in(&fast_select, window, |this, _, event, _, cx| {
                 this.on_model_picked(Tier::Fast, event, cx)
@@ -59,6 +81,15 @@ impl Settings {
             cx.subscribe_in(&deep_select, window, |this, _, event, _, cx| {
                 this.on_model_picked(Tier::Deep, event, cx)
             }),
+            cx.subscribe_in(
+                &opacity,
+                window,
+                |this, _, event: &SliderEvent, _, cx| match event {
+                    SliderEvent::Change(value) | SliderEvent::Release(value) => {
+                        this.set_opacity(value.start(), cx)
+                    }
+                },
+            ),
         ];
 
         let mut settings = Self {
@@ -68,6 +99,10 @@ impl Settings {
             model_status: HashMap::new(),
             fast_select,
             deep_select,
+            opacity,
+            ask_input,
+            ask_deep_input,
+            pending_saves: 0,
             message: cx
                 .global::<AppState>()
                 .load_error
@@ -266,6 +301,163 @@ impl Settings {
         self.apply_recommendations(cx);
         self.refresh_selects(window, cx);
         game_editor::refresh_models(cx);
+    }
+
+    fn save_now(&mut self, cx: &mut Context<Self>) {
+        self.message = cx
+            .global::<AppState>()
+            .save()
+            .err()
+            .map(|err| Message::Error(format!("Couldn't save settings: {err:#}")));
+        cx.notify();
+    }
+
+    fn save_soon(&mut self, cx: &mut Context<Self>) {
+        self.pending_saves += 1;
+        let save = self.pending_saves;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(400))
+                .await;
+            this.update(cx, |this, cx| {
+                if this.pending_saves == save {
+                    this.save_now(cx);
+                }
+            })
+        })
+        .detach();
+    }
+
+    fn set_theme(&mut self, theme: &str, cx: &mut Context<Self>) {
+        cx.global_mut::<AppState>().config.overlay.theme = theme.to_owned();
+        self.save_now(cx);
+        // The overlay previews the change right away.
+        cx.refresh_windows();
+    }
+
+    fn set_opacity(&mut self, opacity: f32, cx: &mut Context<Self>) {
+        cx.global_mut::<AppState>().config.overlay.opacity = opacity;
+        self.save_soon(cx);
+        cx.refresh_windows();
+    }
+
+    fn apply_hotkeys(&mut self, cx: &mut Context<Self>) {
+        let shortcuts = Hotkeys {
+            ask: self.ask_input.read(cx).value().trim().to_owned(),
+            ask_deep: self.ask_deep_input.read(cx).value().trim().to_owned(),
+        };
+        let bound = if cx.has_global::<HotkeyService>() {
+            cx.update_global::<HotkeyService, _>(|service, _| service.bind(&shortcuts))
+        } else {
+            Err(anyhow::anyhow!("the hotkey listener isn't running"))
+        };
+        match bound {
+            Ok(()) => {
+                let message = format!(
+                    "Shortcuts updated: {} for fast, {} for deep.",
+                    hotkeys::pretty(&shortcuts.ask),
+                    hotkeys::pretty(&shortcuts.ask_deep)
+                );
+                cx.global_mut::<AppState>().config.hotkeys = shortcuts;
+                self.save_now(cx);
+                if self.message.is_none() {
+                    self.message = Some(Message::Info(message));
+                }
+                cx.refresh_windows();
+            }
+            Err(err) => {
+                self.message = Some(Message::Error(format!("Kept the old shortcuts: {err:#}")));
+                cx.notify();
+            }
+        }
+    }
+
+    fn reset_hotkeys(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let defaults = Hotkeys::default();
+        self.ask_input
+            .update(cx, |input, cx| input.set_value(defaults.ask, window, cx));
+        self.ask_deep_input.update(cx, |input, cx| {
+            input.set_value(defaults.ask_deep, window, cx)
+        });
+        self.apply_hotkeys(cx);
+    }
+
+    fn render_appearance(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let overlay = &cx.global::<AppState>().config.overlay;
+        let current = themes::find(&overlay.theme).id;
+        let percent = (overlay.opacity() * 100.0).round();
+        let swatches = THEMES.iter().map(|theme| {
+            let selected = theme.id == current;
+            div()
+                .id(theme.id)
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .border_2()
+                .border_color(if selected {
+                    rgb(theme.accent)
+                } else {
+                    rgba(0xffffff26)
+                })
+                .bg(theme.swatch())
+                .cursor_pointer()
+                .child(div().size_3().rounded_full().bg(rgb(theme.accent)))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(theme.text))
+                        .child(theme.name),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.set_theme(theme.id, cx)))
+        });
+
+        section("Appearance")
+            .child(div().text_sm().child("Overlay theme"))
+            .child(div().flex().flex_wrap().gap_2().children(swatches))
+            .child(
+                div()
+                    .text_sm()
+                    .child(format!("Overlay background opacity: {percent}%")),
+            )
+            .child(Slider::new(&self.opacity))
+            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                "Drag the overlay by its header to move it; Cue remembers where you leave it.",
+            ))
+    }
+
+    fn render_hotkeys(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        section("Hotkeys")
+            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                "Modifiers and a key joined with +, like CmdOrCtrl+Shift+Space. Modifiers: \
+                 CmdOrCtrl, Cmd, Ctrl, Alt, Shift. Keys: A–Z, 0–9, F1–F12, Space, Enter, Tab, \
+                 arrow keys and more.",
+            ))
+            .child(div().text_sm().child("Ask (fast)"))
+            .child(Input::new(&self.ask_input))
+            .child(div().text_sm().child("Ask deeper"))
+            .child(Input::new(&self.ask_deep_input))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("apply-hotkeys")
+                            .primary()
+                            .label("Apply")
+                            .on_click(cx.listener(|this, _, _, cx| this.apply_hotkeys(cx))),
+                    )
+                    .child(
+                        Button::new("reset-hotkeys")
+                            .ghost()
+                            .label("Reset to defaults")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.reset_hotkeys(window, cx)),
+                            ),
+                    ),
+            )
     }
 
     fn show_overlay(&mut self, cx: &mut Context<Self>) {
@@ -476,7 +668,11 @@ fn section(title: &'static str) -> Div {
 
 impl Render for Settings {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let hotkeys = cx.global::<AppState>().config.hotkeys.clone();
+        let config = &cx.global::<AppState>().config;
+        let (ask, ask_deep) = (
+            hotkeys::pretty(&config.hotkeys.ask),
+            hotkeys::pretty(&config.hotkeys.ask_deep),
+        );
         let click_through = self.overlay.read(cx).click_through();
 
         div()
@@ -498,18 +694,19 @@ impl Render for Settings {
                     .child(div().text_xs().text_color(rgb(MUTED)).child(
                         "Cue only suggests models. Pick any model your keys can reach that accepts images.",
                     ))
-                    .child(div().text_sm().child(format!("Fast — quick questions ({})", hotkeys.ask)))
+                    .child(div().text_sm().child(format!("Fast — quick questions ({ask})")))
                     .child(Select::new(&self.fast_select).placeholder("Pick a model (add a key first if the list is empty)"))
-                    .child(div().text_sm().child(format!("Deep — strategy ({})", hotkeys.ask_deep)))
+                    .child(div().text_sm().child(format!("Deep — strategy ({ask_deep})")))
                     .child(Select::new(&self.deep_select).placeholder("Pick a model (add a key first if the list is empty)")),
             )
             .child(self.render_games(cx))
+            .child(self.render_appearance(cx))
+            .child(self.render_hotkeys(cx))
             .child(
                 section("Overlay")
                     .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                        "Esc hides the overlay. {} or {} captures the game and brings it back; \
-                         this button brings back the last conversation without a new capture.",
-                        hotkeys.ask, hotkeys.ask_deep
+                        "Esc hides the overlay. {ask} or {ask_deep} captures the game and brings it \
+                         back; this button brings back the last conversation without a new capture."
                     )))
                     .child(
                         Button::new("show-overlay")

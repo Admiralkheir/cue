@@ -43,14 +43,58 @@ impl Default for Hotkeys {
     }
 }
 
+/// Where the overlay sits, in screen points.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OverlayPosition {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// How the overlay looks and where it sits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OverlaySettings {
+    /// One of the app's built-in themes; unknown names fall back to the default.
+    pub theme: String,
+    /// The panel's background opacity, from [`Self::MIN_OPACITY`] to 1.
+    pub opacity: f32,
+    /// `None` puts it in the top-right corner of the primary display.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<OverlayPosition>,
+}
+
+impl OverlaySettings {
+    /// Below this the panel stops being readable over a busy game.
+    pub const MIN_OPACITY: f32 = 0.3;
+
+    pub fn opacity(&self) -> f32 {
+        if self.opacity.is_finite() {
+            self.opacity.clamp(Self::MIN_OPACITY, 1.0)
+        } else {
+            Self::default().opacity
+        }
+    }
+}
+
+impl Default for OverlaySettings {
+    fn default() -> Self {
+        Self {
+            theme: "midnight".into(),
+            opacity: 0.8,
+            position: None,
+        }
+    }
+}
+
 /// Everything Cue persists, except API keys, which live in the OS keychain.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub accounts: Vec<ProviderAccount>,
     pub fast_model: Option<ModelRef>,
     pub deep_model: Option<ModelRef>,
     pub hotkeys: Hotkeys,
+    pub overlay: OverlaySettings,
     pub games: Vec<GameProfile>,
 }
 
@@ -190,6 +234,11 @@ mod tests {
                 model: "claude-sonnet-5-5".into(),
             }),
             hotkeys: Hotkeys::default(),
+            overlay: OverlaySettings {
+                theme: "ocean".into(),
+                opacity: 0.65,
+                position: Some(OverlayPosition { x: 40.0, y: 60.5 }),
+            },
             games: vec![GameProfile {
                 notes: "Playing a ranged build.\nNo spoilers.".into(),
                 deep_model: Some(ModelRef {
@@ -243,6 +292,18 @@ mod tests {
         assert_eq!(config.deep_model, pick("kept"));
         assert_eq!(config.games[0].fast_model, None);
         assert_eq!(config.games[0].deep_model, pick("kept"));
+    }
+
+    #[test]
+    fn clamps_overlay_opacity() {
+        let overlay = |opacity| OverlaySettings {
+            opacity,
+            ..OverlaySettings::default()
+        };
+        assert_eq!(overlay(0.05).opacity(), OverlaySettings::MIN_OPACITY);
+        assert_eq!(overlay(3.0).opacity(), 1.0);
+        assert_eq!(overlay(f32::NAN).opacity(), 0.8);
+        assert_eq!(overlay(0.5).opacity(), 0.5);
     }
 
     #[test]

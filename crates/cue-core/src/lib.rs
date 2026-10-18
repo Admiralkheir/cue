@@ -14,7 +14,7 @@ pub mod recommend;
 pub mod secrets;
 
 pub use capture::{Capture, CaptureError, EncodedFrame, capture_focused_window};
-pub use config::{Config, ConfigError, Hotkeys};
+pub use config::{Config, ConfigError, Hotkeys, OverlayPosition, OverlaySettings};
 pub use conversation::{Conversation, Role, Turn};
 pub use games::{GameProfile, find_profile};
 pub use provider::{ModelInfo, ModelRef, ProviderAccount, ProviderKind};

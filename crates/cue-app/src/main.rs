@@ -5,6 +5,7 @@ mod model_picker;
 mod overlay;
 mod platform;
 mod settings;
+mod themes;
 
 use cue_core::Tier;
 use futures::StreamExt;
@@ -25,12 +26,16 @@ fn main() {
         let overlay = overlay::open(cx).expect("failed to open the overlay");
 
         let hotkey_config = cx.global::<AppState>().config.hotkeys.clone();
-        match hotkeys::register(&hotkey_config) {
-            Ok((manager, mut presses)) => {
+        let started = hotkeys::start().and_then(|(mut service, presses)| {
+            let bound = service.bind(&hotkey_config);
+            // Kept even if binding failed, so new shortcuts can be set in settings.
+            cx.set_global(service);
+            bound.map(|()| presses)
+        });
+        match started {
+            Ok(mut presses) => {
                 let overlay = overlay.clone();
                 cx.spawn(async move |cx| {
-                    // Dropping the manager would unregister the hotkeys.
-                    let _manager = manager;
                     while let Some(tier) = presses.next().await {
                         overlay
                             .update(cx, |overlay, window, cx| overlay.ask(tier, window, cx))
@@ -69,7 +74,7 @@ fn main() {
             .detach();
         }
 
-        let bounds = Bounds::centered(None, size(px(560.), px(640.)), cx);
+        let bounds = Bounds::centered(None, size(px(600.), px(820.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             ..Default::default()

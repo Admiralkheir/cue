@@ -54,6 +54,17 @@ pub fn frontmost_app_pid() -> Option<u32> {
     None
 }
 
+/// Starts moving the window with the mouse; call it from a left mouse-down handler.
+pub fn start_drag(window: &Window) {
+    #[cfg(target_os = "windows")]
+    if let Ok(RawWindowHandle::Win32(handle)) = raw_handle(window) {
+        win32::start_drag(handle);
+        return;
+    }
+    // GPUI implements this on macOS and Linux, but not on Windows.
+    window.start_window_move();
+}
+
 /// Whether key presses currently go to this window.
 pub fn has_keyboard(window: &Window) -> bool {
     match raw_handle(window) {
@@ -225,6 +236,23 @@ mod win32 {
             let _ = SetForegroundWindow(hwnd(handle));
         }
         Ok(())
+    }
+
+    pub fn start_drag(handle: Win32WindowHandle) {
+        use windows::Win32::Foundation::WPARAM;
+        use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+        use windows::Win32::UI::WindowsAndMessaging::{HTCAPTION, SendMessageW, WM_NCLBUTTONDOWN};
+        // Pretend the press landed on a title bar, so Windows runs its own move loop.
+        // SAFETY: `hwnd` belongs to a live GPUI window owned by this thread.
+        unsafe {
+            let _ = ReleaseCapture();
+            SendMessageW(
+                hwnd(handle),
+                WM_NCLBUTTONDOWN,
+                Some(WPARAM(HTCAPTION as usize)),
+                None,
+            );
+        }
     }
 
     pub fn has_keyboard(handle: Win32WindowHandle) -> bool {
