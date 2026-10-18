@@ -1,0 +1,52 @@
+name: Release
+
+# Pushing a tag like v0.1.0 builds every platform and opens a draft GitHub release with
+# the downloads and their checksums. Review the draft, then publish it by hand.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Check the tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match version $version in Cargo.toml"
+            exit 1
+          fi
+
+  package:
+    needs: verify
+    uses: ./.github/workflows/package.yml
+
+  publish:
+    name: Draft the release
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: cue-*
+          merge-multiple: true
+      - name: Checksums
+        run: (cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+      - name: Create the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --draft --verify-tag \
+            --title "Cue ${GITHUB_REF_NAME#v}" \
+            --notes-file packaging/release-notes.md \
+            --generate-notes

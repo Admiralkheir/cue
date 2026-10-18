@@ -114,7 +114,7 @@ impl Overlay {
                 }
                 state.config.overlay.position = Some(position);
                 if let Err(err) = state.save() {
-                    eprintln!("cue: couldn't save the overlay position: {err:#}");
+                    tracing::error!("couldn't save the overlay position: {err:#}");
                 }
             })
         })
@@ -188,6 +188,14 @@ impl Overlay {
                 let state = cx.global_mut::<AppState>();
                 state.remember_window(&capture.app_name, &capture.title);
                 let game = state.config.game_for(&capture.app_name, &capture.title);
+                tracing::info!(
+                    app = %capture.app_name,
+                    profile = game.is_some(),
+                    width = capture.frame.width,
+                    height = capture.frame.height,
+                    kb = capture.frame.jpeg.len() / 1024,
+                    "captured the game window"
+                );
                 let conversation = Conversation::about(&capture, game);
                 // The settings window lists recently captured windows.
                 cx.refresh_windows();
@@ -201,13 +209,16 @@ impl Overlay {
                     note: None,
                 }))
             }
-            Err(err) => Status::Failed(err.to_string()),
+            Err(err) => {
+                tracing::warn!("capture failed: {err}");
+                Status::Failed(err.to_string())
+            }
         };
 
         let shown = platform::show_and_focus(window)
             .and_then(|()| self.set_click_through(false, window, cx));
         if let Err(err) = shown {
-            eprintln!("cue: couldn't bring up the overlay: {err:#}");
+            tracing::warn!("couldn't bring up the overlay: {err:#}");
         }
         self.input.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
@@ -379,7 +390,7 @@ impl Overlay {
             platform::show(window)
         };
         if let Err(err) = shown {
-            eprintln!("cue: couldn't show the overlay: {err:#}");
+            tracing::warn!("couldn't show the overlay: {err:#}");
         }
     }
 
@@ -387,7 +398,7 @@ impl Overlay {
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let hidden = platform::hide(window).and_then(|()| self.set_click_through(true, window, cx));
         if let Err(err) = hidden {
-            eprintln!("cue: couldn't hide the overlay: {err:#}");
+            tracing::warn!("couldn't hide the overlay: {err:#}");
         }
     }
 
@@ -609,6 +620,15 @@ fn request_answer(
     deltas: &mpsc::UnboundedSender<String>,
 ) -> Result<Completion, String> {
     let name = account.display_name();
+    let provider = account.kind.slug();
+    let started = std::time::Instant::now();
+    tracing::info!(
+        provider,
+        model,
+        ?tier,
+        turns = conversation.turns.len(),
+        "asking"
+    );
     let describe = |err: ProviderError| {
         let rejected_key = matches!(
             err,
@@ -625,9 +645,46 @@ fn request_answer(
         };
         format!("{name}: {err}{hint}")
     };
-    let key = secrets::api_key(&account.id).map_err(|err| format!("{name}: {err}"))?;
-    let provider = providers::connect(account, key).map_err(describe)?;
-    provider
+    let result = secrets::api_key(&account.id)
+        .map_err(|err| format!("{name}: {err}"))
+        .and_then(|key| providers::connect(account, key).map_err(describe))
+        .and_then(|client| {
+            stream_answer(
+                &*client,
+                model,
+                tier,
+                conversation,
+                cancel,
+                deltas,
+                describe,
+            )
+        });
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match &result {
+        Ok(completion) => tracing::info!(
+            provider,
+            model,
+            stop = ?completion.stop,
+            input_tokens = completion.usage.input_tokens,
+            output_tokens = completion.usage.output_tokens,
+            elapsed_ms,
+            "answered"
+        ),
+        Err(err) => tracing::warn!(provider, model, elapsed_ms, "request failed: {err}"),
+    }
+    result
+}
+
+fn stream_answer(
+    client: &dyn providers::Provider,
+    model: &str,
+    tier: Tier,
+    conversation: &Conversation,
+    cancel: &AtomicBool,
+    deltas: &mpsc::UnboundedSender<String>,
+    describe: impl Fn(ProviderError) -> String,
+) -> Result<Completion, String> {
+    client
         .stream(model, tier, conversation, &mut |piece| {
             let stopped =
                 cancel.load(Ordering::Relaxed) || deltas.unbounded_send(piece.to_owned()).is_err();
@@ -703,13 +760,17 @@ pub fn open(cx: &mut App) -> Result<OverlayHandle> {
     })?;
     window.update(cx, |_, window, cx| {
         if let Err(err) = platform::make_frameless(window) {
-            eprintln!("cue: couldn't remove the overlay frame: {err:#}");
+            tracing::warn!("couldn't remove the overlay frame: {err:#}");
         }
         // gpui-kit's Root paints the theme background; the overlay draws its own panel.
         Root::update(window, cx, |root, _, _| {
             root.style().background = Some(transparent_black().into());
         });
-        platform::set_click_through(window, true)
-    })??;
+        // Not available everywhere (Linux, for now); the overlay then just takes clicks.
+        if let Err(err) = platform::set_click_through(window, true) {
+            tracing::warn!("click-through isn't available: {err:#}");
+            view.update(cx, |overlay, _| overlay.click_through = false);
+        }
+    })?;
     Ok(OverlayHandle { window, view })
 }

@@ -31,8 +31,16 @@ the game.
 - [x] Providers: Anthropic, OpenAI, Google Gemini, OpenCode Zen and OpenCode Go
 - [ ] Local models through Ollama
 
-Windows and macOS are both first-class targets, but so far Cue has only been built and
-run on macOS. The Windows code paths haven't been compiled yet.
+Windows and macOS are both first-class targets; so far Cue has been run on macOS and
+built and tested in CI on Windows. Linux builds are experimental: hotkeys only work on
+X11, and the overlay can't pass clicks through or hide itself yet.
+
+## Download
+
+Get the latest build from [Releases](https://github.com/Admiralkheir/cue/releases):
+a universal `Cue.app` for macOS 13+, a zip with `cue.exe` for Windows 10/11, and a
+tarball for Linux (x86_64, experimental). The builds aren't code-signed yet, so macOS
+and Windows ask before the first launch; the release notes say how to get past that.
 
 ## Building
 
@@ -43,12 +51,13 @@ Cue is written in Rust on top of [GPUI](https://gpui.rs) (Zed's UI framework) th
 cargo run -p cue-app
 ```
 
-On macOS the default `runtime_shaders` feature compiles Metal shaders at startup, so the
-Xcode Command Line Tools are enough. With full Xcode installed you can precompile them:
+On macOS the Xcode Command Line Tools are enough, since Metal shaders are compiled at
+startup. On Linux, `scripts/install-linux-deps.sh` installs the system libraries
+(Debian/Ubuntu). `scripts/package-macos.sh` builds the universal `Cue.app` locally.
 
-```sh
-cargo build -p cue-app --release --no-default-features
-```
+When something goes wrong, Cue writes logs to `~/Library/Logs/Cue` (macOS),
+`%LOCALAPPDATA%\Cue\logs` (Windows) or `~/.local/state/cue` (Linux); Settings →
+Troubleshooting opens the folder.
 
 ## Contributing
 

@@ -293,7 +293,7 @@ fn open(profile: GameProfile, is_new: bool, cx: &mut App) {
         cx.new(|cx| GameEditor::new(profile, is_new, window, cx))
     }) {
         Ok((window, view)) => cx.set_global(EditorWindow(Some((window, view.downgrade())))),
-        Err(err) => eprintln!("cue: couldn't open the game profile: {err:#}"),
+        Err(err) => tracing::error!("couldn't open the game profile: {err:#}"),
     }
 }
 

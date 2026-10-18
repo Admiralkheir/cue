@@ -1,0 +1,52 @@
+name: Bug report
+description: Something in Cue doesn't work as it should.
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did Cue do instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the game in borderless mode
+        2. Press the fast hotkey
+        3. ...
+  - type: input
+    id: game
+    attributes:
+      label: Game
+      description: Which game, and does it run fullscreen, borderless or windowed?
+  - type: input
+    id: system
+    attributes:
+      label: System
+      description: Operating system and version, for example macOS 26.1 or Windows 11 24H2.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Cue version
+      description: The download or commit you're running.
+  - type: input
+    id: provider
+    attributes:
+      label: Provider and model
+      description: For example "OpenCode Zen, claude-haiku-5-5". Never paste your API key.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log file
+      description: |
+        Settings → Troubleshooting → Open log folder, then drag the newest `cue.*.log` here.
+        Logs live in `~/Library/Logs/Cue` (macOS), `%LOCALAPPDATA%\Cue\logs` (Windows) or
+        `~/.local/state/cue` (Linux). They never contain API keys, screenshots, questions,
+        answers or window titles, but glance over them before sharing.
+    validations:
+      required: true

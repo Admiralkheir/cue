@@ -18,15 +18,18 @@ env:
 
 jobs:
   check:
-    # Cue targets macOS and Windows; GPUI on Linux would need extra system packages.
     name: Check (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [macos-latest, windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    # Linux support is experimental, so it doesn't fail the run yet.
+    continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
+      - if: runner.os == 'Linux'
+        run: scripts/install-linux-deps.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -38,22 +41,10 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
-  windows-build:
-    # A ready-to-run cue.exe for trying Cue on Windows without a Rust toolchain.
-    name: Windows build
+  package:
+    # Downloadable builds of main for every platform; see package.yml.
     if: github.event_name != 'pull_request'
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build release
-        run: cargo build -p cue-app --release --locked
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cue-windows-x64
-          path: target/release/cue.exe
-          retention-days: 30
+    uses: ./.github/workflows/package.yml
 
   dependencies:
     name: Licenses and advisories

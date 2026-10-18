@@ -54,7 +54,10 @@ impl AppState {
             .config_path
             .as_ref()
             .context("there's no config directory")?;
-        Ok(self.config.save_to(path)?)
+        self.config.save_to(path).map_err(|err| {
+            tracing::error!("couldn't save the config: {err}");
+            err.into()
+        })
     }
 
     pub fn remember_window(&mut self, app: &str, title: &str) {

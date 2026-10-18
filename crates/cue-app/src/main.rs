@@ -4,6 +4,7 @@
 mod app_state;
 mod game_editor;
 mod hotkeys;
+mod logging;
 mod model_picker;
 mod overlay;
 mod platform;
@@ -19,6 +20,7 @@ use crate::app_state::AppState;
 use crate::settings::Settings;
 
 fn main() {
+    logging::init();
     gpui_kit::application().run(|cx| {
         gpui_kit::init(cx);
         // Games are mostly dark, and the overlay is designed for a dark theme.
@@ -31,6 +33,14 @@ fn main() {
         let hotkey_config = cx.global::<AppState>().config.hotkeys.clone();
         let started = hotkeys::start().and_then(|(mut service, presses)| {
             let bound = service.bind(&hotkey_config);
+            match &bound {
+                Ok(()) => tracing::info!(
+                    fast = %hotkey_config.ask,
+                    deep = %hotkey_config.ask_deep,
+                    "hotkeys registered"
+                ),
+                Err(err) => tracing::warn!("hotkeys not registered: {err:#}"),
+            }
             // Kept even if binding failed, so new shortcuts can be set in settings.
             cx.set_global(service);
             bound.map(|()| presses)

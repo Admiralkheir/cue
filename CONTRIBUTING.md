@@ -19,12 +19,15 @@ You need a recent stable Rust toolchain.
 cargo run -p cue-app
 ```
 
-- **macOS:** the Xcode Command Line Tools are enough; the default `runtime_shaders`
-  feature compiles Metal shaders at startup. Grant the terminal (or the built app)
-  Screen Recording permission in System Settings so Cue can capture windows.
-- **Windows:** use the MSVC toolchain. Cue captures with Windows Graphics Capture. To try
-  Cue without building it, download the `cue-windows-x64` artifact from the latest CI run
-  on `main`. It isn't code-signed yet, so SmartScreen asks before running it.
+- **macOS:** the Xcode Command Line Tools are enough; Metal shaders are compiled at
+  startup. Grant the terminal (or the built app) Screen Recording permission in System
+  Settings so Cue can capture windows. `scripts/package-macos.sh` builds `Cue.app`.
+- **Windows:** use the MSVC toolchain. Cue captures with Windows Graphics Capture.
+- **Linux (experimental):** run `scripts/install-linux-deps.sh` on Debian/Ubuntu first.
+
+Every push to `main` also builds downloadable packages for all three platforms (the
+`cue-macos`, `cue-windows` and `cue-linux` artifacts of the CI run), and tagging `vX.Y.Z`
+drafts a GitHub release with them.
 
 Each rebuilt development binary has a new code signature, so macOS asks for your login
 keychain password the first time it reads a stored API key.
@@ -41,6 +44,12 @@ cargo test --workspace
 
 Provider clients are tested against a local mock server (`providers/mock.rs`), so the
 tests need no API keys or network access.
+
+## Logs
+
+Cue logs to `~/Library/Logs/Cue` (macOS), `%LOCALAPPDATA%\Cue\logs` (Windows) or
+`~/.local/state/cue` (Linux), one file per day, kept for a week. `CUE_LOG=debug` turns up
+the detail. Never log API keys, screenshots, questions, answers or window titles.
 
 ## Handy for development
 

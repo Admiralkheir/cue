@@ -106,6 +106,21 @@ impl Config {
             .ok_or(ConfigError::NoConfigDir)
     }
 
+    /// Where Cue writes its logs: `~/Library/Logs/Cue` on macOS, `%LOCALAPPDATA%\Cue\logs`
+    /// on Windows and `~/.local/state/cue` (`$XDG_STATE_HOME/cue`) on Linux.
+    pub fn log_dir() -> Option<PathBuf> {
+        let base = directories::BaseDirs::new()?;
+        Some(if cfg!(target_os = "macos") {
+            base.home_dir().join("Library").join("Logs").join("Cue")
+        } else if cfg!(windows) {
+            base.data_local_dir().join("Cue").join("logs")
+        } else {
+            base.state_dir()
+                .unwrap_or(base.data_local_dir())
+                .join("cue")
+        })
+    }
+
     /// Loads the config, or returns the default when the file doesn't exist yet.
     pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
         let text = match fs::read_to_string(path) {

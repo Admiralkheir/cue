@@ -5,7 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cue_core::providers;
 use cue_core::{
-    Hotkeys, ModelInfo, OverlaySettings, ProviderAccount, ProviderKind, Tier, recommend, secrets,
+    Config, Hotkeys, ModelInfo, OverlaySettings, ProviderAccount, ProviderKind, Tier, recommend,
+    secrets,
 };
 use gpui_kit::component::Disableable;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -21,6 +22,8 @@ use crate::model_picker::{self, ModelChoice, ModelSelect};
 use crate::overlay::OverlayHandle;
 use crate::themes::{self, THEMES};
 
+const BUG_REPORT_URL: &str =
+    "https://github.com/Admiralkheir/cue/issues/new?template=bug_report.yml";
 const MUTED: u32 = 0x9aa0a6;
 const ERROR: u32 = 0xf28b82;
 const WARNING: u32 = 0xfdd663;
@@ -137,13 +140,17 @@ impl Settings {
             this.update_in(cx, |this, window, cx| {
                 let status = match result {
                     Ok(models) => {
+                        tracing::info!(account = %id, models = models.len(), "listed models");
                         let status = ModelStatus::Loaded(models.len());
                         cx.global_mut::<AppState>()
                             .models
                             .insert(id.clone(), models);
                         status
                     }
-                    Err(err) => ModelStatus::Failed(err),
+                    Err(err) => {
+                        tracing::warn!(account = %id, "couldn't list models: {err}");
+                        ModelStatus::Failed(err)
+                    }
                 };
                 this.model_status.insert(id, status);
                 this.apply_recommendations(cx);
@@ -263,6 +270,7 @@ impl Settings {
             let saved = save_key.await;
             this.update_in(cx, |this, window, cx| {
                 if let Err(err) = saved {
+                    tracing::error!("couldn't store the key: {err}");
                     this.message = Some(Message::Error(format!("Couldn't store the key: {err}")));
                     cx.notify();
                     return;
@@ -294,7 +302,7 @@ impl Settings {
         let id = id.to_owned();
         cx.background_spawn(async move {
             if let Err(err) = secrets::delete_api_key(&id) {
-                eprintln!("cue: couldn't delete the key for {id}: {err}");
+                tracing::error!(account = %id, "couldn't delete the key: {err}");
             }
         })
         .detach();
@@ -457,6 +465,36 @@ impl Settings {
                                 cx.listener(|this, _, window, cx| this.reset_hotkeys(window, cx)),
                             ),
                     ),
+            )
+    }
+
+    fn render_troubleshooting(&self) -> impl IntoElement {
+        let dir = Config::log_dir();
+        let location = dir.as_ref().map_or_else(
+            || "This system has no log directory.".to_owned(),
+            |dir| format!("Logs are kept for a week in {}", dir.display()),
+        );
+        section("Troubleshooting")
+            .child(div().text_xs().text_color(rgb(MUTED)).child(location))
+            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                "When reporting a bug, attach the latest log. Logs never contain API keys, \
+                 screenshots, questions, answers or window titles.",
+            ))
+            .children(dir.map(|dir| {
+                Button::new("open-logs")
+                    .outline()
+                    .label("Open log folder")
+                    .on_click(move |_, _, cx| {
+                        // The folder only exists once something has been logged.
+                        let _ = std::fs::create_dir_all(&dir);
+                        cx.open_with_system(&dir);
+                    })
+            }))
+            .child(
+                Button::new("report-bug")
+                    .ghost()
+                    .label("Report a bug on GitHub")
+                    .on_click(|_, _, cx| cx.open_url(BUG_REPORT_URL)),
             )
     }
 
@@ -702,6 +740,7 @@ impl Render for Settings {
             .child(self.render_games(cx))
             .child(self.render_appearance(cx))
             .child(self.render_hotkeys(cx))
+            .child(self.render_troubleshooting())
             .child(
                 section("Overlay")
                     .child(div().text_xs().text_color(rgb(MUTED)).child(format!(

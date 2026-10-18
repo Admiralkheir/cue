@@ -1,0 +1,84 @@
+name: Package
+
+# Builds the downloadable app for each platform. Called by CI on pushes to main and by
+# the release workflow; can also be started by hand.
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS (universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      - run: cargo about generate about.hbs --output-file THIRD_PARTY_LICENSES.html
+      - run: scripts/package-macos.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cue-macos
+          path: dist/*.zip
+          retention-days: 30
+
+  windows:
+    name: Windows (x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      - run: cargo about generate about.hbs --output-file THIRD_PARTY_LICENSES.html
+      - run: cargo build -p cue-app --release --locked
+      - name: Package
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          mkdir -p dist/Cue
+          cp target/release/cue.exe LICENSE THIRD_PARTY_LICENSES.html dist/Cue/
+          (cd dist && 7z a "Cue-$version-windows-x64.zip" Cue > /dev/null)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cue-windows
+          path: dist/*.zip
+          retention-days: 30
+
+  linux:
+    name: Linux (x86_64, experimental)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/install-linux-deps.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      - run: cargo about generate about.hbs --output-file THIRD_PARTY_LICENSES.html
+      - run: cargo build -p cue-app --release --locked
+      - name: Package
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          mkdir -p dist/cue
+          cp target/release/cue LICENSE THIRD_PARTY_LICENSES.html dist/cue/
+          tar -C dist -czf "dist/cue-$version-linux-x86_64.tar.gz" cue
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cue-linux
+          path: dist/*.tar.gz
+          retention-days: 30
