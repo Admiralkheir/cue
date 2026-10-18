@@ -22,7 +22,9 @@ cargo run -p cue-app
 - **macOS:** the Xcode Command Line Tools are enough; the default `runtime_shaders`
   feature compiles Metal shaders at startup. Grant the terminal (or the built app)
   Screen Recording permission in System Settings so Cue can capture windows.
-- **Windows:** use the MSVC toolchain. Cue captures with Windows Graphics Capture.
+- **Windows:** use the MSVC toolchain. Cue captures with Windows Graphics Capture. To try
+  Cue without building it, download the `cue-windows-x64` artifact from the latest CI run
+  on `main`. It isn't code-signed yet, so SmartScreen asks before running it.
 
 Each rebuilt development binary has a new code signature, so macOS asks for your login
 keychain password the first time it reads a stored API key.

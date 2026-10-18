@@ -1,3 +1,6 @@
+// Release builds on Windows are GUI apps; debug builds keep a console for the logs.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app_state;
 mod game_editor;
 mod hotkeys;

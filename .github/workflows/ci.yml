@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -36,6 +37,23 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
+
+  windows-build:
+    # A ready-to-run cue.exe for trying Cue on Windows without a Rust toolchain.
+    name: Windows build
+    if: github.event_name != 'pull_request'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release
+        run: cargo build -p cue-app --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cue-windows-x64
+          path: target/release/cue.exe
+          retention-days: 30
 
   dependencies:
     name: Licenses and advisories
