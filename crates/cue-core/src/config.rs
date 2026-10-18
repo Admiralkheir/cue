@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::games::{GameProfile, find_profile};
 use crate::provider::{ModelRef, ProviderAccount};
 use crate::recommend::Tier;
 
@@ -50,6 +51,7 @@ pub struct Config {
     pub fast_model: Option<ModelRef>,
     pub deep_model: Option<ModelRef>,
     pub hotkeys: Hotkeys,
+    pub games: Vec<GameProfile>,
 }
 
 impl Config {
@@ -102,11 +104,55 @@ impl Config {
     pub fn account(&self, id: &str) -> Option<&ProviderAccount> {
         self.accounts.iter().find(|account| account.id == id)
     }
+
+    /// The profile for a captured window, if the player made one.
+    pub fn game_for(&self, app_name: &str, title: &str) -> Option<&GameProfile> {
+        find_profile(&self.games, app_name, title)
+    }
+
+    pub fn game(&self, id: &str) -> Option<&GameProfile> {
+        self.games.iter().find(|game| game.id == id)
+    }
+
+    pub fn game_mut(&mut self, id: &str) -> Option<&mut GameProfile> {
+        self.games.iter_mut().find(|game| game.id == id)
+    }
+
+    /// The model to ask: the game's own pick if it has one, the global one otherwise.
+    pub fn model_for_game<'a>(
+        &'a self,
+        tier: Tier,
+        game: Option<&'a GameProfile>,
+    ) -> Option<&'a ModelRef> {
+        game.and_then(|game| game.model_for(tier))
+            .or_else(|| self.model_for(tier))
+    }
+
+    /// Drops every reference to an account that's being removed.
+    pub fn forget_account(&mut self, account_id: &str) {
+        self.accounts.retain(|account| account.id != account_id);
+        let slots = [&mut self.fast_model, &mut self.deep_model]
+            .into_iter()
+            .chain(
+                self.games
+                    .iter_mut()
+                    .flat_map(|game| [&mut game.fast_model, &mut game.deep_model]),
+            );
+        for slot in slots {
+            if slot
+                .as_ref()
+                .is_some_and(|model| model.account_id == account_id)
+            {
+                *slot = None;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::games::GameProfile;
     use crate::provider::ProviderKind;
 
     #[test]
@@ -144,6 +190,14 @@ mod tests {
                 model: "claude-sonnet-5-5".into(),
             }),
             hotkeys: Hotkeys::default(),
+            games: vec![GameProfile {
+                notes: "Playing a ranged build.\nNo spoilers.".into(),
+                deep_model: Some(ModelRef {
+                    account_id: "o".into(),
+                    model: "gpt-6-sol".into(),
+                }),
+                ..GameProfile::for_window("Hades II", "Hades II")
+            }],
         };
 
         config.save_to(&path).unwrap();
@@ -153,6 +207,42 @@ mod tests {
             "claude-sonnet-5-5"
         );
         assert_eq!(config.account("o").unwrap().display_name(), "Work");
+
+        let game = config.game_for("Hades II", "Hades II");
+        assert_eq!(
+            config.model_for_game(Tier::Deep, game).unwrap().model,
+            "gpt-6-sol"
+        );
+        assert_eq!(
+            config.model_for_game(Tier::Fast, game).unwrap().model,
+            "claude-haiku-5-5"
+        );
+    }
+
+    #[test]
+    fn forgetting_an_account_clears_every_pick_that_used_it() {
+        let pick = |account: &str| {
+            Some(ModelRef {
+                account_id: account.into(),
+                model: "m".into(),
+            })
+        };
+        let mut config = Config {
+            fast_model: pick("gone"),
+            deep_model: pick("kept"),
+            games: vec![GameProfile {
+                fast_model: pick("gone"),
+                deep_model: pick("kept"),
+                ..GameProfile::for_window("Game", "")
+            }],
+            ..Config::default()
+        };
+
+        config.forget_account("gone");
+        assert_eq!(config.fast_model, None);
+        assert_eq!(config.deep_model, pick("kept"));
+        assert_eq!(config.games[0].fast_model, None);
+        assert_eq!(config.games[0].deep_model, pick("kept"));
     }
 
     #[test]

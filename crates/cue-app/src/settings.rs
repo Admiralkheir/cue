@@ -1,49 +1,29 @@
-//! The settings window: provider keys, model picks for each tier, hotkeys.
+//! The settings window: provider keys, model picks for each tier, game profiles, overlay.
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cue_core::providers;
-use cue_core::{
-    AccountModels, ModelInfo, ModelRef, ProviderAccount, ProviderKind, Tier, recommend, secrets,
-};
+use cue_core::{ModelInfo, ProviderAccount, ProviderKind, Tier, recommend, secrets};
+use gpui_kit::component::Disableable;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
-use gpui_kit::component::{Disableable, IndexPath};
+use gpui_kit::component::select::{Select, SelectEvent};
 use gpui_kit::*;
 
 use crate::app_state::AppState;
+use crate::game_editor;
+use crate::model_picker::{self, ModelChoice, ModelSelect};
 use crate::overlay::OverlayHandle;
 
 const MUTED: u32 = 0x9aa0a6;
 const ERROR: u32 = 0xf28b82;
 const WARNING: u32 = 0xfdd663;
 
-/// One entry in a tier's model picker.
-#[derive(Clone)]
-struct ModelChoice {
-    title: SharedString,
-    value: ModelRef,
-}
-
-impl SelectItem for ModelChoice {
-    type Value = ModelRef;
-
-    fn title(&self) -> SharedString {
-        self.title.clone()
-    }
-
-    fn value(&self) -> &ModelRef {
-        &self.value
-    }
-}
-
-type ModelSelect = Entity<SelectState<Vec<ModelChoice>>>;
-
-enum Models {
+/// Where an account's model list stands. Loaded lists live in `AppState::models`.
+enum ModelStatus {
     Loading,
-    Loaded(Vec<ModelInfo>),
+    Loaded(usize),
     Failed(String),
 }
 
@@ -56,7 +36,7 @@ pub struct Settings {
     overlay: OverlayHandle,
     new_kind: ProviderKind,
     key_input: Entity<InputState>,
-    models: HashMap<String, Models>,
+    model_status: HashMap<String, ModelStatus>,
     fast_select: ModelSelect,
     deep_select: ModelSelect,
     message: Option<Message>,
@@ -70,8 +50,8 @@ impl Settings {
                 .masked(true)
                 .placeholder("API key")
         });
-        let fast_select = cx.new(|cx| SelectState::new(Vec::new(), None, window, cx));
-        let deep_select = cx.new(|cx| SelectState::new(Vec::new(), None, window, cx));
+        let fast_select = model_picker::new_select(window, cx);
+        let deep_select = model_picker::new_select(window, cx);
         let subscriptions = vec![
             cx.subscribe_in(&fast_select, window, |this, _, event, _, cx| {
                 this.on_model_picked(Tier::Fast, event, cx)
@@ -85,7 +65,7 @@ impl Settings {
             overlay,
             new_kind: ProviderKind::Anthropic,
             key_input,
-            models: HashMap::new(),
+            model_status: HashMap::new(),
             fast_select,
             deep_select,
             message: cx
@@ -107,7 +87,8 @@ impl Settings {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.models.insert(account.id.clone(), Models::Loading);
+        self.model_status
+            .insert(account.id.clone(), ModelStatus::Loading);
         cx.notify();
 
         let id = account.id.clone();
@@ -117,33 +98,31 @@ impl Settings {
             provider.list_models().map_err(|err| err.to_string())
         });
         cx.spawn_in(window, async move |this, cx| {
-            let models = match request.await {
-                Ok(models) => Models::Loaded(models),
-                Err(err) => Models::Failed(err),
-            };
+            let result: Result<Vec<ModelInfo>, String> = request.await;
             this.update_in(cx, |this, window, cx| {
-                this.models.insert(id, models);
+                let status = match result {
+                    Ok(models) => {
+                        let status = ModelStatus::Loaded(models.len());
+                        cx.global_mut::<AppState>()
+                            .models
+                            .insert(id.clone(), models);
+                        status
+                    }
+                    Err(err) => ModelStatus::Failed(err),
+                };
+                this.model_status.insert(id, status);
                 this.apply_recommendations(cx);
                 this.refresh_selects(window, cx);
+                game_editor::refresh_models(cx);
             })
         })
         .detach();
     }
 
-    fn account_models<'a>(&'a self, accounts: &'a [ProviderAccount]) -> Vec<AccountModels<'a>> {
-        accounts
-            .iter()
-            .filter_map(|account| match self.models.get(&account.id) {
-                Some(Models::Loaded(models)) => Some(AccountModels { account, models }),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// Fills each unset tier with the recommended model. The user can change it anytime.
     fn apply_recommendations(&mut self, cx: &mut Context<Self>) {
-        let accounts = cx.global::<AppState>().config.accounts.clone();
-        let available = self.account_models(&accounts);
+        let state = cx.global::<AppState>();
+        let available = model_picker::available(&state.config, &state.models);
         let fast = recommend(Tier::Fast, &available);
         let deep = recommend(Tier::Deep, &available);
         // Without a stronger model that takes images, "deep" uses the fast pick.
@@ -179,48 +158,16 @@ impl Settings {
     }
 
     fn refresh_selects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let config = cx.global::<AppState>().config.clone();
-        let available = self.account_models(&config.accounts);
         for (tier, select) in [
             (Tier::Fast, self.fast_select.clone()),
             (Tier::Deep, self.deep_select.clone()),
         ] {
+            let state = cx.global::<AppState>();
+            let available = model_picker::available(&state.config, &state.models);
             let recommended = recommend(tier, &available);
-            let choices: Vec<ModelChoice> = available
-                .iter()
-                .flat_map(|entry| {
-                    entry
-                        .models
-                        .iter()
-                        // Cue always sends a screenshot.
-                        .filter(|model| model.vision != Some(false))
-                        .map(|model| {
-                            let value = ModelRef {
-                                account_id: entry.account.id.clone(),
-                                model: model.id.clone(),
-                            };
-                            let name = model.display_name.as_deref().unwrap_or(&model.id);
-                            let badge = if recommended.as_ref() == Some(&value) {
-                                " (recommended)"
-                            } else {
-                                ""
-                            };
-                            let title = format!("{name} · {}{badge}", entry.account.display_name());
-                            ModelChoice {
-                                title: title.into(),
-                                value,
-                            }
-                        })
-                })
-                .collect();
-            let selected = config
-                .model_for(tier)
-                .and_then(|current| choices.iter().position(|choice| &choice.value == current))
-                .map(IndexPath::new);
-            select.update(cx, |select, cx| {
-                select.set_items(choices, window, cx);
-                select.set_selected_index(selected, window, cx);
-            });
+            let choices = model_picker::choices(&available, recommended.as_ref());
+            let current = state.config.model_for(tier).cloned();
+            model_picker::fill(&select, choices, &current, window, cx);
         }
         cx.notify();
     }
@@ -231,7 +178,7 @@ impl Settings {
         event: &SelectEvent<Vec<ModelChoice>>,
         cx: &mut Context<Self>,
     ) {
-        let SelectEvent::Confirm(Some(model)) = event else {
+        let SelectEvent::Confirm(Some(Some(model))) = event else {
             return;
         };
         let state = cx.global_mut::<AppState>();
@@ -301,17 +248,13 @@ impl Settings {
 
     fn remove_account(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let state = cx.global_mut::<AppState>();
-        state.config.accounts.retain(|account| account.id != id);
-        for model in [&mut state.config.fast_model, &mut state.config.deep_model] {
-            if model.as_ref().is_some_and(|model| model.account_id == id) {
-                *model = None;
-            }
-        }
+        state.config.forget_account(id);
+        state.models.remove(id);
         self.message = state
             .save()
             .err()
             .map(|err| Message::Error(format!("Couldn't save settings: {err:#}")));
-        self.models.remove(id);
+        self.model_status.remove(id);
 
         let id = id.to_owned();
         cx.background_spawn(async move {
@@ -322,6 +265,7 @@ impl Settings {
         .detach();
         self.apply_recommendations(cx);
         self.refresh_selects(window, cx);
+        game_editor::refresh_models(cx);
     }
 
     fn show_overlay(&mut self, cx: &mut Context<Self>) {
@@ -352,12 +296,12 @@ impl Settings {
     fn render_accounts(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let accounts = cx.global::<AppState>().config.accounts.clone();
         let rows = accounts.into_iter().map(|account| {
-            let status = match self.models.get(&account.id) {
-                Some(Models::Loaded(models)) => div()
+            let status = match self.model_status.get(&account.id) {
+                Some(ModelStatus::Loaded(count)) => div()
                     .text_color(rgb(MUTED))
-                    .child(format!("{} models", models.len())),
-                Some(Models::Failed(err)) => div().text_color(rgb(ERROR)).child(err.clone()),
-                Some(Models::Loading) | None => {
+                    .child(format!("{count} models")),
+                Some(ModelStatus::Failed(err)) => div().text_color(rgb(ERROR)).child(err.clone()),
+                Some(ModelStatus::Loading) | None => {
                     div().text_color(rgb(MUTED)).child("Loading models…")
                 }
             };
@@ -444,6 +388,84 @@ impl Settings {
     }
 }
 
+impl Settings {
+    fn render_games(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = cx.global::<AppState>();
+        let profiles = state.config.games.iter().map(|game| {
+            let mut details = vec![format!("app: {}", game.app)];
+            if let Some(title) = &game.title_contains {
+                details.push(format!("title contains \"{title}\""));
+            }
+            if game.fast_model.is_some() || game.deep_model.is_some() {
+                details.push("own models".into());
+            }
+            if !game.notes.is_empty() {
+                details.push("notes".into());
+            }
+            let id = game.id.clone();
+            row(game.name.clone(), details.join(" · ")).child(
+                Button::new(SharedString::from(format!("edit-{}", game.id)))
+                    .ghost()
+                    .label("Edit")
+                    .on_click(move |_, _, cx| game_editor::edit_profile(&id, cx)),
+            )
+        });
+        let recent = state
+            .recent_windows
+            .iter()
+            .filter(|recent| state.config.game_for(&recent.app, &recent.title).is_none())
+            .enumerate()
+            .map(|(index, recent)| {
+                let (app, title) = (recent.app.clone(), recent.title.clone());
+                row(recent.app.clone(), recent.title.clone()).child(
+                    Button::new(("add-game", index))
+                        .outline()
+                        .label("Add profile")
+                        .on_click(move |_, _, cx| game_editor::edit_window(&app, &title, cx)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let empty = state.config.games.is_empty() && recent.is_empty();
+
+        section("Games")
+            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                "A profile adds your notes to every question about a game and can pick its own \
+                 models. Cue applies it whenever the game's app is the one it captures.",
+            ))
+            .children(profiles)
+            .children((!recent.is_empty()).then(|| {
+                div()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .child("Recently captured")
+            }))
+            .children(recent)
+            .children(empty.then(|| {
+                div()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .child("Capture a game with the hotkey and it shows up here.")
+            }))
+    }
+}
+
+fn row(title: impl Into<SharedString>, detail: impl Into<SharedString>) -> Div {
+    div().flex().items_center().justify_between().gap_3().child(
+        div()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .child(div().truncate().child(title.into()))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .truncate()
+                    .child(detail.into()),
+            ),
+    )
+}
+
 fn section(title: &'static str) -> Div {
     div()
         .flex()
@@ -481,6 +503,7 @@ impl Render for Settings {
                     .child(div().text_sm().child(format!("Deep — strategy ({})", hotkeys.ask_deep)))
                     .child(Select::new(&self.deep_select).placeholder("Pick a model (add a key first if the list is empty)")),
             )
+            .child(self.render_games(cx))
             .child(
                 section("Overlay")
                     .child(div().text_xs().text_color(rgb(MUTED)).child(format!(

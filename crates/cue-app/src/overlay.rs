@@ -18,6 +18,7 @@ use gpui_kit::component::text::TextView;
 use gpui_kit::*;
 
 use crate::app_state::AppState;
+use crate::game_editor;
 use crate::platform;
 
 const SIZE: Size<Pixels> = Size {
@@ -28,6 +29,7 @@ const MARGIN: Pixels = px(24.);
 const TEXT: u32 = 0xe8eaed;
 const MUTED: u32 = 0x9aa0a6;
 const ERROR: u32 = 0xf28b82;
+const LINK: u32 = 0x8ab4f8;
 
 enum Status {
     Idle,
@@ -150,10 +152,16 @@ impl Overlay {
             Ok(capture) => {
                 self.next_session_id += 1;
                 let jpeg = capture.frame.jpeg.clone();
+                let state = cx.global_mut::<AppState>();
+                state.remember_window(&capture.app_name, &capture.title);
+                let game = state.config.game_for(&capture.app_name, &capture.title);
+                let conversation = Conversation::about(&capture, game);
+                // The settings window lists recently captured windows.
+                cx.refresh_windows();
                 Status::Session(Box::new(Session {
                     id: self.next_session_id,
                     tier,
-                    conversation: Conversation::about(&capture),
+                    conversation,
                     thumbnail: Arc::new(Image::from_bytes(ImageFormat::Jpeg, jpeg)),
                     capture,
                     pending: None,
@@ -202,7 +210,10 @@ impl Overlay {
         }
 
         let config = &cx.global::<AppState>().config;
-        let target = config.model_for(session.tier).and_then(|model| {
+        let game = config.game_for(&session.capture.app_name, &session.capture.title);
+        // Notes may have changed since the capture.
+        session.conversation.refresh_game(&session.capture, game);
+        let target = config.model_for_game(session.tier, game).and_then(|model| {
             Some((
                 config.account(&model.account_id)?.clone(),
                 model.model.clone(),
@@ -347,13 +358,26 @@ impl Overlay {
         }
     }
 
-    fn render_session(&self, session: &Session) -> impl IntoElement {
+    fn render_session(&self, session: &Session, cx: &mut Context<Self>) -> impl IntoElement {
         let capture = &session.capture;
-        let title = if capture.title.is_empty() || capture.title == capture.app_name {
-            capture.app_name.clone()
-        } else {
-            format!("{} — {}", capture.app_name, capture.title)
+        let game = cx
+            .global::<AppState>()
+            .config
+            .game_for(&capture.app_name, &capture.title);
+        // A profile names the game; otherwise show what was captured.
+        let title = match game {
+            Some(game) => game.name.clone(),
+            None if capture.title.is_empty() || capture.title == capture.app_name => {
+                capture.app_name.clone()
+            }
+            None => format!("{} — {}", capture.app_name, capture.title),
         };
+        let notes_label = match game {
+            Some(game) if !game.notes.is_empty() => "Edit notes",
+            Some(_) => "Add notes",
+            None => "Add a profile",
+        };
+        let (app, window_title) = (capture.app_name.clone(), capture.title.clone());
         let turns = session
             .conversation
             .turns
@@ -408,7 +432,19 @@ impl Overlay {
                                 capture.frame.width,
                                 capture.frame.height,
                                 capture.frame.jpeg.len().div_ceil(1024)
-                            ))),
+                            )))
+                            .child(
+                                div()
+                                    .id("game-notes")
+                                    .text_xs()
+                                    .text_color(rgb(LINK))
+                                    .cursor_pointer()
+                                    .hover(|style| style.underline())
+                                    .child(notes_label)
+                                    .on_click(move |_, _, cx| {
+                                        game_editor::edit_window(&app, &window_title, cx)
+                                    }),
+                            ),
                     ),
             )
             .child(
@@ -462,7 +498,7 @@ impl Render for Overlay {
                 .text_color(rgb(ERROR))
                 .child(message.clone())
                 .into_any_element(),
-            Status::Session(session) => self.render_session(session).into_any_element(),
+            Status::Session(session) => self.render_session(session, cx).into_any_element(),
         };
 
         // The window is transparent; only this rounded panel is drawn.

@@ -1,5 +1,7 @@
 mod app_state;
+mod game_editor;
 mod hotkeys;
+mod model_picker;
 mod overlay;
 mod platform;
 mod settings;

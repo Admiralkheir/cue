@@ -25,7 +25,7 @@ the game.
 - [x] Global hotkeys for the fast and deep tiers
 - [x] Capture of the game window only
 - [x] Streaming answers with follow-up questions on the same capture
-- [ ] Game detection from the active window, plus per-game profiles
+- [x] Game detection from the active window, plus per-game profiles (notes and models)
 - [x] Providers: Anthropic, OpenAI, Google Gemini, OpenCode Zen and OpenCode Go
 - [ ] Local models through Ollama
 
