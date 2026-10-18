@@ -10,6 +10,11 @@ fn raw_handle(window: &Window) -> Result<RawWindowHandle> {
 }
 
 /// Lets mouse events fall through the window to whatever is underneath it, i.e. the game.
+// Only the macOS and Windows arms read `enabled`.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows")),
+    allow(unused_variables)
+)]
 pub fn set_click_through(window: &Window, enabled: bool) -> Result<()> {
     match raw_handle(window)? {
         #[cfg(target_os = "macos")]
