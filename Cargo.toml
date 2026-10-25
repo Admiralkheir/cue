@@ -16,7 +16,7 @@ cue-core = { path = "crates/cue-core" }
 
 # gpui-kit re-exports gpui (the gpui-pre weekly Zed snapshot) plus gpui-component.
 # gpui_platform must stay on the exact gpui-pre version gpui-kit pins.
-gpui-kit = "0.7.3"
+gpui-kit = "0.8.0"
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9" }
 
 raw-window-handle = { version = "0.6", features = ["std"] }
