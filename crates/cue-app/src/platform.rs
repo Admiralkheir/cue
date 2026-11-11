@@ -1,7 +1,10 @@
 //! Native window tweaks that GPUI doesn't expose.
+//!
+//! On Windows the changes are applied once the current GPUI event or update is over (see
+//! [`after_update`]), so errors there are logged rather than returned.
 
 use anyhow::{Result, bail};
-use gpui_kit::Window;
+use gpui_kit::{App, Window};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 fn raw_handle(window: &Window) -> Result<RawWindowHandle> {
@@ -9,30 +12,50 @@ fn raw_handle(window: &Window) -> Result<RawWindowHandle> {
     Ok(HasWindowHandle::window_handle(window)?.as_raw())
 }
 
+/// Runs a Win32 call once the GPUI event or update we're in has finished.
+///
+/// Calls like `ShowWindow` deliver messages to the window before they return. GPUI can't
+/// handle those while the app is borrowed, as it is in every event handler and update: it
+/// logs "RefCell already borrowed" and drops them, so its idea of whether the window is
+/// visible, and where, goes stale.
+#[cfg(target_os = "windows")]
+fn after_update(cx: &App, call: impl FnOnce() -> Result<()> + 'static) {
+    cx.foreground_executor()
+        .spawn(async move {
+            if let Err(err) = call() {
+                tracing::warn!("window change failed: {err:#}");
+            }
+        })
+        .detach();
+}
+
 /// Lets mouse events fall through the window to whatever is underneath it, i.e. the game.
-// Only the macOS and Windows arms read `enabled`.
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "windows")),
-    allow(unused_variables)
-)]
-pub fn set_click_through(window: &Window, enabled: bool) -> Result<()> {
+// Only the macOS and Windows arms read `enabled`, and only Windows needs `cx`.
+#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+pub fn set_click_through(window: &Window, enabled: bool, cx: &App) -> Result<()> {
     match raw_handle(window)? {
         #[cfg(target_os = "macos")]
         RawWindowHandle::AppKit(handle) => macos::set_click_through(handle, enabled),
         #[cfg(target_os = "windows")]
-        RawWindowHandle::Win32(handle) => win32::set_click_through(handle, enabled),
+        RawWindowHandle::Win32(handle) => {
+            after_update(cx, move || win32::set_click_through(handle, enabled));
+            Ok(())
+        }
         other => bail!("click-through isn't supported for {other:?}"),
     }
 }
 
 /// Strips the system frame so only what the overlay draws is visible.
-pub fn make_frameless(window: &Window) -> Result<()> {
+#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+pub fn make_frameless(window: &Window, cx: &App) -> Result<()> {
     match raw_handle(window)? {
         #[cfg(target_os = "macos")]
         RawWindowHandle::AppKit(handle) => macos::make_frameless(handle),
-        // GPUI already creates pop-up windows without a frame on Windows.
         #[cfg(target_os = "windows")]
-        RawWindowHandle::Win32(_) => Ok(()),
+        RawWindowHandle::Win32(handle) => {
+            after_update(cx, move || win32::make_frameless(handle));
+            Ok(())
+        }
         other => bail!("frameless windows aren't supported for {other:?}"),
     }
 }
@@ -41,12 +64,16 @@ pub fn make_frameless(window: &Window) -> Result<()> {
 ///
 /// Neither macOS nor Windows lets a background app take the keyboard, so Cue becomes
 /// the active app and the game loses focus until the overlay is hidden again.
-pub fn show_and_focus(window: &Window) -> Result<()> {
+#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+pub fn show_and_focus(window: &Window, cx: &App) -> Result<()> {
     match raw_handle(window)? {
         #[cfg(target_os = "macos")]
         RawWindowHandle::AppKit(handle) => macos::show_and_focus(handle),
         #[cfg(target_os = "windows")]
-        RawWindowHandle::Win32(handle) => win32::show_and_focus(handle),
+        RawWindowHandle::Win32(handle) => {
+            after_update(cx, move || win32::show_and_focus(handle));
+            Ok(())
+        }
         other => bail!("focusing isn't supported for {other:?}"),
     }
 }
@@ -82,23 +109,31 @@ pub fn has_keyboard(window: &Window) -> bool {
 }
 
 /// Shows the window without taking the keyboard from the app in front.
-pub fn show(window: &Window) -> Result<()> {
+#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+pub fn show(window: &Window, cx: &App) -> Result<()> {
     match raw_handle(window)? {
         #[cfg(target_os = "macos")]
         RawWindowHandle::AppKit(handle) => macos::show(handle),
         #[cfg(target_os = "windows")]
-        RawWindowHandle::Win32(handle) => win32::show(handle),
+        RawWindowHandle::Win32(handle) => {
+            after_update(cx, move || win32::show(handle));
+            Ok(())
+        }
         other => bail!("showing isn't supported for {other:?}"),
     }
 }
 
 /// Hides the window and hands the keyboard back to the app that had it (the game).
-pub fn hide(window: &Window) -> Result<()> {
+#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+pub fn hide(window: &Window, cx: &App) -> Result<()> {
     match raw_handle(window)? {
         #[cfg(target_os = "macos")]
         RawWindowHandle::AppKit(handle) => macos::hide(handle),
         #[cfg(target_os = "windows")]
-        RawWindowHandle::Win32(handle) => win32::hide(handle),
+        RawWindowHandle::Win32(handle) => {
+            after_update(cx, move || win32::hide(handle));
+            Ok(())
+        }
         other => bail!("hiding isn't supported for {other:?}"),
     }
 }
@@ -203,9 +238,9 @@ mod win32 {
     use raw_window_handle::Win32WindowHandle;
     use windows::Win32::Foundation::{COLORREF, HWND};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GetForegroundWindow, GetWindowLongPtrW, LWA_ALPHA, SW_HIDE, SW_SHOW,
-        SW_SHOWNOACTIVATE, SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW,
-        ShowWindow, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+        GWL_EXSTYLE, GetForegroundWindow, GetWindowLongPtrW, IsIconic, LWA_ALPHA, SW_HIDE,
+        SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE, SetForegroundWindow, SetLayeredWindowAttributes,
+        SetWindowLongPtrW, ShowWindow, WS_EX_LAYERED, WS_EX_TRANSPARENT,
     };
 
     fn hwnd(handle: Win32WindowHandle) -> HWND {
@@ -233,29 +268,76 @@ mod win32 {
         Ok(())
     }
 
+    // GPUI pop-ups have no title bar, but on Windows 11 DWM still rounds the corners and
+    // draws a border and shadow around the whole window, well outside the overlay's panel.
+    pub fn make_frameless(handle: Win32WindowHandle) -> Result<()> {
+        use windows::Win32::Graphics::Dwm::{
+            DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_NCRENDERING_POLICY,
+            DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWINDOWATTRIBUTE,
+            DwmSetWindowAttribute,
+        };
+
+        fn set<T>(
+            hwnd: HWND,
+            attribute: DWMWINDOWATTRIBUTE,
+            value: T,
+        ) -> windows::core::Result<()> {
+            // SAFETY: `value` lives across the call and the size matches its type.
+            unsafe {
+                DwmSetWindowAttribute(
+                    hwnd,
+                    attribute,
+                    (&raw const value).cast(),
+                    size_of::<T>() as u32,
+                )
+            }
+        }
+
+        let hwnd = hwnd(handle);
+        // Turns off the shadow, which is drawn as part of the non-client area.
+        set(hwnd, DWMWA_NCRENDERING_POLICY, DWMNCRP_DISABLED)?;
+        // Windows 10 doesn't round corners or draw this border, and rejects both settings.
+        let _ = set(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND);
+        let _ = set(hwnd, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE);
+        Ok(())
+    }
+
     pub fn show_and_focus(handle: Win32WindowHandle) -> Result<()> {
+        let hwnd = hwnd(handle);
         // SAFETY: as above. The return values only report the previous visibility and
         // whether Windows honored the focus request, which it may refuse.
         unsafe {
-            let _ = ShowWindow(hwnd(handle), SW_SHOW);
-            let _ = SetForegroundWindow(hwnd(handle));
+            // A minimized window, such as the settings window, only comes back when restored.
+            let show = if IsIconic(hwnd).as_bool() {
+                SW_RESTORE
+            } else {
+                SW_SHOW
+            };
+            let _ = ShowWindow(hwnd, show);
+            let _ = SetForegroundWindow(hwnd);
         }
         Ok(())
     }
 
     pub fn start_drag(handle: Win32WindowHandle) {
-        use windows::Win32::Foundation::WPARAM;
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
         use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
-        use windows::Win32::UI::WindowsAndMessaging::{HTCAPTION, SendMessageW, WM_NCLBUTTONDOWN};
-        // Pretend the press landed on a title bar, so Windows runs its own move loop.
+        use windows::Win32::UI::WindowsAndMessaging::{
+            HTCAPTION, PostMessageW, SC_MOVE, WM_SYSCOMMAND,
+        };
+        // Ask for a title-bar drag, so Windows runs its own move loop. Posted, not sent:
+        // the loop runs GPUI's timers, such as the input's blinking cursor, and those
+        // panic if they fire while the mouse-down handler calling this still holds the app.
+        // A system command rather than a fake WM_NCLBUTTONDOWN, which GPUI would turn
+        // back into a mouse-down for this handler.
         // SAFETY: `hwnd` belongs to a live GPUI window owned by this thread.
         unsafe {
             let _ = ReleaseCapture();
-            SendMessageW(
-                hwnd(handle),
-                WM_NCLBUTTONDOWN,
-                Some(WPARAM(HTCAPTION as usize)),
-                None,
+            let _ = PostMessageW(
+                Some(hwnd(handle)),
+                WM_SYSCOMMAND,
+                WPARAM((SC_MOVE | HTCAPTION) as usize),
+                LPARAM(0),
             );
         }
     }

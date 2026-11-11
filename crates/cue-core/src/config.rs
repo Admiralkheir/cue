@@ -86,6 +86,31 @@ impl Default for OverlaySettings {
     }
 }
 
+/// What Cue does about new releases when it starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateSettings {
+    /// Ask GitHub for a newer release and say so in the settings window.
+    pub check_on_startup: bool,
+    /// Install a newer release right away and restart into it. Implies checking.
+    pub install_automatically: bool,
+}
+
+impl UpdateSettings {
+    pub fn checks_on_startup(&self) -> bool {
+        self.check_on_startup || self.install_automatically
+    }
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self {
+            check_on_startup: true,
+            install_automatically: false,
+        }
+    }
+}
+
 /// Everything Cue persists, except API keys, which live in the OS keychain.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -96,6 +121,7 @@ pub struct Config {
     pub hotkeys: Hotkeys,
     pub overlay: OverlaySettings,
     pub games: Vec<GameProfile>,
+    pub updates: UpdateSettings,
 }
 
 impl Config {
@@ -262,6 +288,10 @@ mod tests {
                 }),
                 ..GameProfile::for_window("Hades II", "Hades II")
             }],
+            updates: UpdateSettings {
+                check_on_startup: false,
+                install_automatically: true,
+            },
         };
 
         config.save_to(&path).unwrap();

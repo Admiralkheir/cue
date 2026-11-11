@@ -9,7 +9,9 @@ mod model_picker;
 mod overlay;
 mod platform;
 mod settings;
+mod single_instance;
 mod themes;
+mod updates;
 
 use cue_core::Tier;
 use futures::StreamExt;
@@ -17,10 +19,22 @@ use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 
 use crate::app_state::AppState;
+use crate::overlay::OverlayHandle;
 use crate::settings::Settings;
 
 fn main() {
     logging::init();
+    let relaunched = std::env::args().any(|arg| arg == cue_core::update::RELAUNCHED_ARG);
+    if relaunched {
+        tracing::info!(
+            version = cue_core::update::CURRENT_VERSION,
+            "restarted after an update"
+        );
+    }
+    let Some(mut show_requests) = single_instance::claim(relaunched) else {
+        tracing::info!("Cue is already running; asked it to show its settings");
+        return;
+    };
     gpui_kit::application().run(|cx| {
         gpui_kit::init(cx);
         // Games are mostly dark, and the overlay is designed for a dark theme.
@@ -87,15 +101,44 @@ fn main() {
             .detach();
         }
 
-        let bounds = Bounds::centered(None, size(px(600.), px(820.)), cx);
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            ..Default::default()
-        };
-        gpui_kit::open_window(options, cx, move |window, cx| {
-            cx.new(|cx| Settings::new(overlay, window, cx))
-        })
-        .expect("failed to open the settings window");
+        let mut settings =
+            open_settings(overlay.clone(), cx).expect("failed to open the settings window");
         cx.activate(true);
+        // The settings window, open on every start, shows what the check finds.
+        updates::on_startup(cx);
+
+        // Launching Cue again brings the settings back, reopening them if they were closed.
+        cx.spawn(async move |cx| {
+            while show_requests.next().await.is_some() {
+                let shown =
+                    settings.update(cx, |_, window, cx| platform::show_and_focus(window, cx));
+                match shown {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => tracing::warn!("couldn't show the settings: {err:#}"),
+                    Err(_) => match cx.update(|cx| open_settings(overlay.clone(), cx)) {
+                        Ok(reopened) => settings = reopened,
+                        Err(err) => tracing::warn!("couldn't reopen the settings: {err:#}"),
+                    },
+                }
+            }
+        })
+        .detach();
     });
+}
+
+fn open_settings(overlay: OverlayHandle, cx: &mut App) -> anyhow::Result<AnyWindowHandle> {
+    let bounds = Bounds::centered(None, size(px(600.), px(820.)), cx);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        // Shown in the taskbar and Alt+Tab on Windows, and in the Window menu on macOS.
+        titlebar: Some(TitlebarOptions {
+            title: Some("Cue".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let (window, _) = gpui_kit::open_window(options, cx, move |window, cx| {
+        cx.new(|cx| Settings::new(overlay, window, cx))
+    })?;
+    Ok(window)
 }
