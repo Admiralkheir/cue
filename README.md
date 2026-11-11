@@ -1,4 +1,4 @@
-# Cue
+# <img src="assets/icon.png" alt="" width="40" align="top"> Cue
 
 [![CI](https://github.com/Admiralkheir/cue/actions/workflows/ci.yml/badge.svg)](https://github.com/Admiralkheir/cue/actions/workflows/ci.yml)
 

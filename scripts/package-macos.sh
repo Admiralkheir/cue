@@ -24,7 +24,7 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 lipo -create -output "$app/Contents/MacOS/cue" "${binaries[@]}"
 sed "s/@VERSION@/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
-cp LICENSE "$app/Contents/Resources/"
+cp assets/Cue.icns LICENSE "$app/Contents/Resources/"
 if [[ -f THIRD_PARTY_LICENSES.html ]]; then
     cp THIRD_PARTY_LICENSES.html "$app/Contents/Resources/"
 fi

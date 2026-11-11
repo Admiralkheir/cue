@@ -135,6 +135,8 @@ fn open_settings(overlay: OverlayHandle, cx: &mut App) -> anyhow::Result<AnyWind
             title: Some("Cue".into()),
             ..Default::default()
         }),
+        // Matches packaging/linux/cue.desktop, so Wayland shows the icon.
+        app_id: Some("cue".into()),
         ..Default::default()
     };
     let (window, _) = gpui_kit::open_window(options, cx, move |window, cx| {

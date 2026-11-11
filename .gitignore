@@ -1,4 +1,5 @@
 /target
+/scripts/render-icons/target
 .DS_Store
 *.swp
 .idea/
