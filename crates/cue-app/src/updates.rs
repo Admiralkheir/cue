@@ -34,6 +34,8 @@ impl UpdateStatus {
 /// Cleans up after the last update and, if the user wants it, checks for the next one.
 pub fn on_startup(cx: &mut App) {
     cx.background_spawn(async {
+        // Probes the install folder, so it's worked out here rather than on first render.
+        let _ = update::install_blocker();
         let removed = update::clean_up();
         if removed > 0 {
             tracing::info!(removed, "cleaned up after the last update");

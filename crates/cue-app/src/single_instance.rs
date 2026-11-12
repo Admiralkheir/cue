@@ -54,6 +54,12 @@ mod win32 {
                     }
                     std::thread::sleep(Duration::from_millis(200));
                 }
+                Claim::Taken(event) if wait_for_previous => {
+                    // Handing over would leave no Cue at all once the old copy is gone, so
+                    // run anyway and share the event: later launches still find this copy.
+                    tracing::warn!("the previous copy of Cue is still running; starting anyway");
+                    return Some(listen(event));
+                }
                 Claim::Taken(event) => {
                     // SAFETY: `event` is the handle just opened. Only the foreground app may
                     // hand the foreground on, and a freshly launched one is it: without the
@@ -99,7 +105,11 @@ mod win32 {
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
             return Claim::Taken(event);
         }
+        Claim::Ours(listen(event))
+    }
 
+    /// Keeps `event` open for the rest of the run and yields each time a later launch sets it.
+    fn listen(event: HANDLE) -> mpsc::UnboundedReceiver<()> {
         let (requests_tx, requests) = mpsc::unbounded();
         // A HANDLE holds a raw pointer, which can't cross threads as is.
         let event = event.0 as usize;
@@ -117,6 +127,6 @@ mod win32 {
         if let Err(err) = spawned {
             tracing::warn!("couldn't wait for later launches of Cue: {err}");
         }
-        Claim::Ours(requests)
+        requests
     }
 }

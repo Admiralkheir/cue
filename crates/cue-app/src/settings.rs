@@ -747,7 +747,8 @@ impl Settings {
                 Checkbox::new("install-automatically")
                     .label("Install updates automatically when Cue starts")
                     .checked(settings.install_automatically)
-                    .disabled(blocker.is_some())
+                    // Still lets it be turned off, which also frees "check on startup".
+                    .disabled(blocker.is_some() && !settings.install_automatically)
                     .on_click(cx.listener(|this, checked: &bool, _, cx| {
                         let checked = *checked;
                         this.set_update_settings(

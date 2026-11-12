@@ -7,7 +7,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::Value;
 use ureq::RequestBuilder;
-use ureq::typestate::{WithBody, WithoutBody};
+use ureq::config::ConfigBuilder;
+use ureq::typestate::{AgentScope, WithBody, WithoutBody};
 
 use super::ProviderError;
 use super::sse::Events;
@@ -16,12 +17,17 @@ use crate::capture::EncodedFrame;
 /// Sent with every request so providers can tell Cue's traffic apart.
 pub const USER_AGENT: &str = concat!("cue/", env!("CARGO_PKG_VERSION"));
 
-pub fn agent() -> ureq::Agent {
+/// What every request Cue makes shares; callers add the timeouts that suit them.
+pub fn agent_config() -> ConfigBuilder<AgentScope> {
     ureq::Agent::config_builder()
         .user_agent(USER_AGENT)
         // Read error bodies ourselves instead of getting a bare status code.
         .http_status_as_error(false)
         .timeout_connect(Some(Duration::from_secs(15)))
+}
+
+pub fn agent() -> ureq::Agent {
+    agent_config()
         .timeout_recv_response(Some(Duration::from_secs(120)))
         .build()
         .into()
@@ -82,12 +88,19 @@ pub fn error_message(body: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-pub fn http_error(status: u16, body: &str) -> ProviderError {
-    let message = serde_json::from_str::<Value>(body)
+/// The [`error_message`] in an error body, or the start of the body when it has none.
+pub fn error_text(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|body| error_message(&body))
-        .unwrap_or_else(|| body.chars().take(200).collect());
-    ProviderError::Http { status, message }
+        .unwrap_or_else(|| body.chars().take(200).collect())
+}
+
+pub fn http_error(status: u16, body: &str) -> ProviderError {
+    ProviderError::Http {
+        status,
+        message: error_text(body),
+    }
 }
 
 pub fn network(err: ureq::Error) -> ProviderError {

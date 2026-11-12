@@ -4,7 +4,7 @@ mod anthropic;
 mod chat_completions;
 mod gemini;
 mod google;
-mod http;
+pub(crate) mod http;
 #[cfg(test)]
 mod mock;
 mod openai;

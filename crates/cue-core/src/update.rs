@@ -14,13 +14,14 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::providers::USER_AGENT;
+use crate::providers::http::{agent_config, error_text};
 
 /// The version of this build.
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -114,25 +115,17 @@ struct GithubRelease {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .user_agent(USER_AGENT)
-        .http_status_as_error(false)
-        .timeout_connect(Some(Duration::from_secs(15)))
+    agent_config()
         .timeout_recv_response(Some(Duration::from_secs(30)))
+        // Without it a connection that stalls mid-download would leave the install hanging
+        // for good. Generous, so a slow but working connection still gets there.
+        .timeout_recv_body(Some(Duration::from_secs(20 * 60)))
         .build()
         .into()
 }
 
 fn network(err: impl ToString) -> UpdateError {
     UpdateError::Network(err.to_string())
-}
-
-/// GitHub's `{"message": …}`, or the start of the body.
-fn github_message(body: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|body| body["message"].as_str().map(str::to_owned))
-        .unwrap_or_else(|| body.chars().take(200).collect())
 }
 
 /// Asks GitHub for the latest published release. `None` when this build is that release
@@ -154,7 +147,7 @@ pub fn check() -> Result<Option<Release>, UpdateError> {
         _ => {
             return Err(UpdateError::Http {
                 status,
-                message: github_message(&body),
+                message: error_text(&body),
             });
         }
     }
@@ -266,8 +259,30 @@ fn locate() -> Result<Location, UpdateError> {
 }
 
 /// Why this copy can't install updates itself, if it can't. It can still check for them.
-pub fn install_blocker() -> Option<String> {
-    locate().err().map(|err| err.to_string())
+///
+/// Worked out once per run, since the settings window asks on every render.
+pub fn install_blocker() -> Option<&'static str> {
+    static BLOCKER: OnceLock<Option<String>> = OnceLock::new();
+    BLOCKER
+        .get_or_init(|| match locate() {
+            Ok(location) => writable(&location).err(),
+            Err(err) => Some(err.to_string()),
+        })
+        .as_deref()
+}
+
+/// Whether an update can unpack next to the app, which is where it swaps the new copy in.
+fn writable(location: &Location) -> Result<(), String> {
+    let dir = location.dir().map_err(|err| err.to_string())?;
+    let probe = dir.join(crate::unique_id(LEFTOVER_PREFIX));
+    fs::create_dir(&probe).map_err(|_| {
+        format!(
+            "Cue can't change {}, so it can't update itself there.",
+            dir.display()
+        )
+    })?;
+    let _ = fs::remove_dir(&probe);
+    Ok(())
 }
 
 /// An installed update, waiting for Cue to restart.
@@ -329,7 +344,7 @@ fn get(agent: &ureq::Agent, url: &str) -> Result<ureq::Body, UpdateError> {
         let text = body.read_to_string().unwrap_or_default();
         return Err(UpdateError::Http {
             status,
-            message: github_message(&text),
+            message: error_text(&text),
         });
     }
     Ok(body)
@@ -459,16 +474,18 @@ fn swap_executable(exe: &Path, unpacked: &Path) -> Result<(), UpdateError> {
         .parent()
         .ok_or_else(|| UpdateError::CantInstall("Cue's executable has no folder".into()))?;
 
-    // The files shipped beside it (licenses) aren't in use, so they're simply replaced.
+    // The files shipped beside it (licenses) aren't in use, so they're simply replaced. Only
+    // the ones already there, though: Cue may share its folder (Downloads, ~/.local/bin),
+    // and an update shouldn't scatter new files into it.
     for entry in fs::read_dir(folder)
         .map_err(io_error("couldn't read the update"))?
         .flatten()
     {
         let path = entry.path();
-        if path == new_exe || !path.is_file() {
+        let target = dir.join(entry.file_name());
+        if path == new_exe || !path.is_file() || !target.is_file() {
             continue;
         }
-        let target = dir.join(entry.file_name());
         fs::rename(&path, &target)
             .map_err(io_error(format!("couldn't replace {}", target.display())))?;
     }
@@ -683,8 +700,12 @@ mod tests {
         fs::write(installed.join("LICENSE"), "old license").unwrap();
         fs::write(folder.join(ARCHIVE_EXE), "new").unwrap();
         fs::write(folder.join("LICENSE"), "new license").unwrap();
+        fs::write(folder.join("cue.desktop"), "new desktop file").unwrap();
 
         swap_executable(&exe, &unpacked).unwrap();
+
+        // Only files the install already had are replaced.
+        assert!(!installed.join("cue.desktop").exists());
 
         assert_eq!(fs::read_to_string(&exe).unwrap(), "new");
         assert_eq!(

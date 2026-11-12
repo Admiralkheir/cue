@@ -125,8 +125,15 @@ fn app_name_from(raw: String) -> String {
         return raw;
     }
     let file = raw.rsplit('\\').next().unwrap_or_default();
+    // `get`, not slicing: the last four bytes of a non-ASCII name can split a character.
     let stem = match file.len().checked_sub(4) {
-        Some(end) if file[end..].eq_ignore_ascii_case(".exe") => &file[..end],
+        Some(end)
+            if file
+                .get(end..)
+                .is_some_and(|ext| ext.eq_ignore_ascii_case(".exe")) =>
+        {
+            &file[..end]
+        }
         _ => file,
     };
     stem.to_owned()
@@ -214,6 +221,8 @@ mod tests {
         assert_eq!(app_name_from("Notepad".into()), "Notepad");
         assert_eq!(app_name_from("Hollow Knight".into()), "Hollow Knight");
         assert_eq!(app_name_from(String::new()), "");
+        assert_eq!(app_name_from(r"C:\Games\ゲーム".into()), "ゲーム");
+        assert_eq!(app_name_from(r"C:\Games\ゲーム.exe".into()), "ゲーム");
     }
 
     #[test]

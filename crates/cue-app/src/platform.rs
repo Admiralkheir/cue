@@ -1,10 +1,11 @@
 //! Native window tweaks that GPUI doesn't expose.
 //!
 //! On Windows the changes are applied once the current GPUI event or update is over (see
-//! [`after_update`]), so errors there are logged rather than returned.
+//! [`after_update`]), so errors there are logged rather than returned. Click-through is the
+//! exception: its caller gets the outcome back, because the overlay keeps track of it.
 
 use anyhow::{Result, bail};
-use gpui_kit::{App, Window};
+use gpui_kit::{App, Task, Window};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 fn raw_handle(window: &Window) -> Result<RawWindowHandle> {
@@ -30,17 +31,22 @@ fn after_update(cx: &App, call: impl FnOnce() -> Result<()> + 'static) {
 }
 
 /// Lets mouse events fall through the window to whatever is underneath it, i.e. the game.
+///
+/// An error means the platform can't do it at all. Otherwise the returned task finishes
+/// once the change has been made, with its outcome: right away on macOS, after the current
+/// update on Windows.
 // Only the macOS and Windows arms read `enabled`, and only Windows needs `cx`.
 #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
-pub fn set_click_through(window: &Window, enabled: bool, cx: &App) -> Result<()> {
+pub fn set_click_through(window: &Window, enabled: bool, cx: &App) -> Result<Task<Result<()>>> {
     match raw_handle(window)? {
         #[cfg(target_os = "macos")]
-        RawWindowHandle::AppKit(handle) => macos::set_click_through(handle, enabled),
-        #[cfg(target_os = "windows")]
-        RawWindowHandle::Win32(handle) => {
-            after_update(cx, move || win32::set_click_through(handle, enabled));
-            Ok(())
+        RawWindowHandle::AppKit(handle) => {
+            Ok(Task::ready(macos::set_click_through(handle, enabled)))
         }
+        #[cfg(target_os = "windows")]
+        RawWindowHandle::Win32(handle) => Ok(cx
+            .foreground_executor()
+            .spawn(async move { win32::set_click_through(handle, enabled) })),
         other => bail!("click-through isn't supported for {other:?}"),
     }
 }

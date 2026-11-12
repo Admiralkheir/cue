@@ -142,9 +142,24 @@ impl Overlay {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
-        platform::set_click_through(window, enabled, cx)?;
+        let applied = platform::set_click_through(window, enabled, cx)?;
         self.click_through = enabled;
         cx.notify();
+        // On Windows the change only lands after this update. If it fails there, the window
+        // does the opposite of what was asked, so record that instead.
+        cx.spawn(async move |this, cx| {
+            if let Err(err) = applied.await {
+                tracing::warn!("couldn't change click-through: {err:#}");
+                this.update(cx, |overlay, cx| {
+                    if overlay.click_through == enabled {
+                        overlay.click_through = !enabled;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
         Ok(())
     }
 
@@ -155,7 +170,6 @@ impl Overlay {
         }
     }
 
-    /// Captures the game, then brings the overlay up for a question to the `tier` model.
     /// Answers a hotkey press: captures the game and starts a new conversation about it.
     ///
     /// When an answer was left on screen, the press brings that conversation back instead,
@@ -844,7 +858,9 @@ pub fn open(cx: &mut App) -> Result<OverlayHandle> {
             root.style().background = Some(transparent_black().into());
         });
         // Not available everywhere (Linux, for now); the overlay then just takes clicks.
-        if let Err(err) = platform::set_click_through(window, true, cx) {
+        if let Err(err) = view.update(cx, |overlay, cx| {
+            overlay.set_click_through(true, window, cx)
+        }) {
             tracing::warn!("click-through isn't available: {err:#}");
             view.update(cx, |overlay, _| overlay.click_through = false);
         }
