@@ -25,6 +25,9 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSResponder", "NSRunningApplication", "NSView", "NSWindow", "NSWorkspace"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Security",
+    "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
@@ -37,6 +40,9 @@ ureq = "3.4"
 keyring = "4.2"
 base64 = "0.22"
 serde_json = "1"
+# Self-update: comparing release versions and checking downloads against SHA256SUMS.txt.
+semver = "1"
+sha2 = "0.10"
 
 anyhow = "1"
 tracing = "0.1"

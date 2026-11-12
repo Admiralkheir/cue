@@ -12,9 +12,10 @@ pub mod provider;
 pub mod providers;
 pub mod recommend;
 pub mod secrets;
+pub mod update;
 
 pub use capture::{Capture, CaptureError, EncodedFrame, capture_focused_window};
-pub use config::{Config, ConfigError, Hotkeys, OverlayPosition, OverlaySettings};
+pub use config::{Config, ConfigError, Hotkeys, OverlayPosition, OverlaySettings, UpdateSettings};
 pub use conversation::{Conversation, Role, Turn};
 pub use games::{GameProfile, find_profile};
 pub use provider::{ModelInfo, ModelRef, ProviderAccount, ProviderKind};

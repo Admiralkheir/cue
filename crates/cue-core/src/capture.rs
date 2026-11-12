@@ -108,12 +108,35 @@ pub fn capture_focused_window(
     let image = target.capture_image()?;
     let (source_width, source_height) = image.dimensions();
     Ok(Capture {
-        app_name: target.app_name().unwrap_or_default(),
+        app_name: app_name_from(target.app_name().unwrap_or_default()),
         title: target.title().unwrap_or_default(),
         source_width,
         source_height,
         frame: encode_jpeg(image, MAX_LONG_EDGE)?,
     })
+}
+
+/// On Windows, xcap falls back to the executable's full path when it can't read an app's
+/// name, which happens for most games and Store apps. Keep only the file name: the path
+/// is no use as a profile name and shouldn't reach the model, since it can hold the
+/// user's name.
+fn app_name_from(raw: String) -> String {
+    if !raw.contains('\\') {
+        return raw;
+    }
+    let file = raw.rsplit('\\').next().unwrap_or_default();
+    // `get`, not slicing: the last four bytes of a non-ASCII name can split a character.
+    let stem = match file.len().checked_sub(4) {
+        Some(end)
+            if file
+                .get(end..)
+                .is_some_and(|ext| ext.eq_ignore_ascii_case(".exe")) =>
+        {
+            &file[..end]
+        }
+        _ => file,
+    };
+    stem.to_owned()
 }
 
 fn window_info(window: &Window, frontmost_pid: Option<u32>) -> WindowInfo {
@@ -186,6 +209,20 @@ mod tests {
         minimized.minimized = true;
         let windows = [window(1, true, 380, 300), minimized];
         assert_eq!(choose_target(&windows, 1), None);
+    }
+
+    #[test]
+    fn keeps_only_the_executable_name_of_a_path() {
+        let dota =
+            r"C:\Program Files (x86)\Steam\steamapps\common\dota 2 beta\game\bin\win64\dota2.exe";
+        assert_eq!(app_name_from(dota.into()), "dota2");
+        assert_eq!(app_name_from(r"D:\Games\Game.EXE".into()), "Game");
+        assert_eq!(app_name_from(r"C:\Tools\launcher".into()), "launcher");
+        assert_eq!(app_name_from("Notepad".into()), "Notepad");
+        assert_eq!(app_name_from("Hollow Knight".into()), "Hollow Knight");
+        assert_eq!(app_name_from(String::new()), "");
+        assert_eq!(app_name_from(r"C:\Games\ゲーム".into()), "ゲーム");
+        assert_eq!(app_name_from(r"C:\Games\ゲーム.exe".into()), "ゲーム");
     }
 
     #[test]

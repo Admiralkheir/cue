@@ -75,7 +75,7 @@ jobs:
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
           mkdir -p dist/cue
-          cp target/release/cue LICENSE THIRD_PARTY_LICENSES.html dist/cue/
+          cp target/release/cue assets/cue.png packaging/linux/cue.desktop LICENSE THIRD_PARTY_LICENSES.html dist/cue/
           tar -C dist -czf "dist/cue-$version-linux-x86_64.tar.gz" cue
       - uses: actions/upload-artifact@v4
         with:

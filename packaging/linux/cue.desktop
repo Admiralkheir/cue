@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Cue
+Comment=AI game assistant: ask about what's on screen
+Exec=cue
+Icon=cue
+Terminal=false
+Categories=Game;Utility;

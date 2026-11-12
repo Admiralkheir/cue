@@ -7,6 +7,8 @@ use anyhow::{Context as _, Result};
 use cue_core::{Config, ModelInfo};
 use gpui_kit::Global;
 
+use crate::updates::UpdateStatus;
+
 /// How many recently captured windows to offer as new game profiles.
 const RECENT_WINDOWS: usize = 6;
 
@@ -26,6 +28,8 @@ pub struct AppState {
     pub models: HashMap<String, Vec<ModelInfo>>,
     /// Windows captured during this run, newest first.
     pub recent_windows: Vec<RecentWindow>,
+    /// Where the check for a newer release stands.
+    pub update: UpdateStatus,
 }
 
 impl Global for AppState {}
@@ -46,6 +50,7 @@ impl AppState {
             load_error,
             models: HashMap::new(),
             recent_windows: Vec::new(),
+            update: UpdateStatus::Idle,
         }
     }
 

@@ -4,12 +4,14 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cue_core::providers;
+use cue_core::update::{self, Release};
 use cue_core::{
     Config, Hotkeys, ModelInfo, OverlaySettings, ProviderAccount, ProviderKind, Tier, recommend,
     secrets,
 };
 use gpui_kit::component::Disableable;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::select::{Select, SelectEvent};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
@@ -21,12 +23,15 @@ use crate::hotkeys::{self, HotkeyService};
 use crate::model_picker::{self, ModelChoice, ModelSelect};
 use crate::overlay::OverlayHandle;
 use crate::themes::{self, THEMES};
+use crate::updates::{self, UpdateStatus};
 
 const BUG_REPORT_URL: &str =
     "https://github.com/Admiralkheir/cue/issues/new?template=bug_report.yml";
+const RELEASES_URL: &str = "https://github.com/Admiralkheir/cue/releases/latest";
 const MUTED: u32 = 0x9aa0a6;
 const ERROR: u32 = 0xf28b82;
 const WARNING: u32 = 0xfdd663;
+const ACCENT: u32 = 0x8ab4f8;
 
 /// Where an account's model list stands. Loaded lists live in `AppState::models`.
 enum ModelStatus {
@@ -619,6 +624,149 @@ impl Settings {
 }
 
 impl Settings {
+    fn set_update_settings(
+        &mut self,
+        change: impl FnOnce(&mut cue_core::UpdateSettings),
+        cx: &mut Context<Self>,
+    ) {
+        change(&mut cx.global_mut::<AppState>().config.updates);
+        self.save_now(cx);
+    }
+
+    /// The notice at the top of the window while a newer version is waiting or installing.
+    fn render_update_banner(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let status = cx.global::<AppState>().update.clone();
+        let (release, text, color, can_act) = match &status {
+            UpdateStatus::Available(release) => (
+                release,
+                format!(
+                    "Cue {} is available. You have {}.",
+                    release.version,
+                    update::CURRENT_VERSION
+                ),
+                ACCENT,
+                true,
+            ),
+            UpdateStatus::Installing(release) => (
+                release,
+                format!("Downloading and installing Cue {}…", release.version),
+                ACCENT,
+                false,
+            ),
+            UpdateStatus::Restarting(release) => (
+                release,
+                format!("Cue {} is installed. Restarting…", release.version),
+                ACCENT,
+                false,
+            ),
+            UpdateStatus::Failed {
+                release: Some(release),
+                error,
+            } => (release, error.clone(), ERROR, true),
+            _ => return None,
+        };
+        let blocker = update::install_blocker();
+        let actions = can_act.then(|| {
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(update_button(release, blocker.is_some()))
+                .child(
+                    Button::new("release-notes")
+                        .ghost()
+                        .label("What's new")
+                        .on_click({
+                            let url = release.notes_url.clone();
+                            move |_, _, cx| cx.open_url(&url)
+                        }),
+                )
+        });
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_3()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(color))
+                .child(div().text_sm().text_color(rgb(color)).child(text))
+                .children(can_act.then_some(blocker).flatten().map(|reason| {
+                    div().text_xs().text_color(rgb(MUTED)).child(format!(
+                        "{reason} Download the new version from GitHub instead."
+                    ))
+                }))
+                .children(actions),
+        )
+    }
+
+    fn render_updates(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = cx.global::<AppState>();
+        let settings = state.config.updates;
+        let status = match &state.update {
+            UpdateStatus::Checking => Some(("Checking for updates…".to_owned(), MUTED)),
+            UpdateStatus::UpToDate => Some(("You have the latest version.".to_owned(), MUTED)),
+            UpdateStatus::Failed {
+                release: None,
+                error,
+            } => Some((error.clone(), ERROR)),
+            // The banner at the top covers the rest.
+            _ => None,
+        };
+        let busy = state.update.busy();
+        let blocker = update::install_blocker();
+
+        section("Updates")
+            .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+                "You're running Cue {}. Cue asks GitHub for new releases; nothing about you \
+                 is sent.",
+                update::CURRENT_VERSION
+            )))
+            .children(
+                status.map(|(text, color)| div().text_sm().text_color(rgb(color)).child(text)),
+            )
+            .child(
+                Button::new("check-updates")
+                    .outline()
+                    .label("Check for updates")
+                    .disabled(busy)
+                    .on_click(|_, _, cx| updates::check(false, cx)),
+            )
+            .child(
+                Checkbox::new("check-on-startup")
+                    .label("Check for updates when Cue starts")
+                    .checked(settings.checks_on_startup())
+                    .disabled(settings.install_automatically)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        let checked = *checked;
+                        this.set_update_settings(|updates| updates.check_on_startup = checked, cx)
+                    })),
+            )
+            .child(
+                Checkbox::new("install-automatically")
+                    .label("Install updates automatically when Cue starts")
+                    .checked(settings.install_automatically)
+                    // Still lets it be turned off, which also frees "check on startup".
+                    .disabled(blocker.is_some() && !settings.install_automatically)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        let checked = *checked;
+                        this.set_update_settings(
+                            |updates| updates.install_automatically = checked,
+                            cx,
+                        )
+                    })),
+            )
+            .child(
+                div().text_xs().text_color(rgb(MUTED)).child(match blocker {
+                    Some(reason) => format!("{reason} New versions can be downloaded from GitHub."),
+                    None => "An automatic update downloads the new version, checks it against the \
+                         release's checksums and restarts Cue into it."
+                        .to_owned(),
+                }),
+            )
+    }
+
     fn render_games(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let state = cx.global::<AppState>();
         let profiles = state.config.games.iter().map(|game| {
@@ -679,6 +827,20 @@ impl Settings {
     }
 }
 
+/// Installs the release, or opens its download page when this copy can't update itself.
+fn update_button(release: &Release, blocked: bool) -> Button {
+    let button = Button::new("install-update").primary();
+    if blocked {
+        return button
+            .label(format!("Download Cue {}", release.version))
+            .on_click(|_, _, cx| cx.open_url(RELEASES_URL));
+    }
+    let release = release.clone();
+    button
+        .label(format!("Update to {}", release.version))
+        .on_click(move |_, _, cx| updates::install(release.clone(), cx))
+}
+
 fn row(title: impl Into<SharedString>, detail: impl Into<SharedString>) -> Div {
     div().flex().items_center().justify_between().gap_3().child(
         div()
@@ -722,6 +884,7 @@ impl Render for Settings {
             .flex_col()
             .gap_5()
             .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child("Cue settings"))
+            .children(self.render_update_banner(cx))
             .children(self.message.as_ref().map(|message| match message {
                 Message::Info(text) => div().text_sm().text_color(rgb(MUTED)).child(text.clone()),
                 Message::Error(text) => div().text_sm().text_color(rgb(ERROR)).child(text.clone()),
@@ -740,12 +903,16 @@ impl Render for Settings {
             .child(self.render_games(cx))
             .child(self.render_appearance(cx))
             .child(self.render_hotkeys(cx))
+            .child(self.render_updates(cx))
             .child(self.render_troubleshooting())
             .child(
                 section("Overlay")
                     .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
                         "Esc hides the overlay. {ask} or {ask_deep} captures the game and brings it \
-                         back; this button brings back the last conversation without a new capture."
+                         back. Going back to the game without Esc leaves the answer on screen, with \
+                         clicks passing through; a hotkey then brings that conversation back, and \
+                         another press captures anew. This button brings back the last \
+                         conversation without a new capture."
                     )))
                     .child(
                         Button::new("show-overlay")

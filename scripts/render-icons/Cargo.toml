@@ -1,0 +1,17 @@
+[package]
+name = "render-icons"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Renders assets/icon.svg into the PNG, ICO and ICNS files the app ships with."
+
+# A one-off tool, kept out of the app's workspace so its dependencies stay out of the
+# app's lockfile and license checks.
+[workspace]
+
+[dependencies]
+resvg = "0.50"
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+icns = "0.5"
+anyhow = "1"

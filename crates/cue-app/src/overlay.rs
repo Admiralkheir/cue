@@ -61,6 +61,10 @@ enum Note {
 
 pub struct Overlay {
     click_through: bool,
+    /// An answer stays on screen after the player went back to the game without Esc.
+    left_on_screen: bool,
+    /// Esc hid the overlay; it stays hidden until a hotkey or the settings bring it back.
+    hidden: bool,
     status: Status,
     next_session_id: u64,
     input: Entity<InputState>,
@@ -82,14 +86,21 @@ impl Overlay {
         let on_move = cx.observe_window_bounds(window, |this, window, cx| {
             this.save_position_later(window, cx)
         });
+        let on_deactivate = cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() {
+                this.leave(window, cx);
+            }
+        });
         Self {
             click_through: true,
+            left_on_screen: false,
+            hidden: false,
             status: Status::Idle,
             next_session_id: 0,
             input,
             scroll: ScrollHandle::new(),
             position_saves: 0,
-            _subscriptions: vec![on_enter, on_move],
+            _subscriptions: vec![on_enter, on_move, on_deactivate],
         }
     }
 
@@ -131,9 +142,24 @@ impl Overlay {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
-        platform::set_click_through(window, enabled)?;
+        let applied = platform::set_click_through(window, enabled, cx)?;
         self.click_through = enabled;
         cx.notify();
+        // On Windows the change only lands after this update. If it fails there, the window
+        // does the opposite of what was asked, so record that instead.
+        cx.spawn(async move |this, cx| {
+            if let Err(err) = applied.await {
+                tracing::warn!("couldn't change click-through: {err:#}");
+                this.update(cx, |overlay, cx| {
+                    if overlay.click_through == enabled {
+                        overlay.click_through = !enabled;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
         Ok(())
     }
 
@@ -144,8 +170,15 @@ impl Overlay {
         }
     }
 
-    /// Captures the game, then brings the overlay up for a question to the `tier` model.
+    /// Answers a hotkey press: captures the game and starts a new conversation about it.
+    ///
+    /// When an answer was left on screen, the press brings that conversation back instead,
+    /// for a follow-up or Esc; pressing again from there captures anew.
     pub fn ask(&mut self, tier: Tier, window: &mut Window, cx: &mut Context<Self>) {
+        if self.left_on_screen {
+            self.show(window, cx);
+            return;
+        }
         match &self.status {
             Status::Capturing(_) => return,
             Status::Session(session) => {
@@ -167,7 +200,7 @@ impl Overlay {
             cx.background_spawn(async move { capture_focused_window(own_pid, frontmost_pid) });
         cx.spawn_in(window, async move |this, cx| {
             let capture = capture.await;
-            this.update_in(cx, |overlay, window, cx| {
+            update_in_overlay(&this, cx, |overlay, window, cx| {
                 overlay.start_session(tier, capture, window, cx)
             })
         })
@@ -215,7 +248,8 @@ impl Overlay {
             }
         };
 
-        let shown = platform::show_and_focus(window)
+        self.hidden = false;
+        let shown = platform::show_and_focus(window, cx)
             .and_then(|()| self.set_click_through(false, window, cx));
         if let Err(err) = shown {
             tracing::warn!("couldn't bring up the overlay: {err:#}");
@@ -230,7 +264,7 @@ impl Overlay {
             cx.background_executor()
                 .timer(Duration::from_millis(400))
                 .await;
-            this.update_in(cx, |overlay, window, cx| {
+            update_in_overlay(&this, cx, |overlay, window, cx| {
                 if platform::has_keyboard(window) {
                     return;
                 }
@@ -305,7 +339,7 @@ impl Overlay {
                 }
             }
             let result = request.await;
-            this.update_in(cx, |overlay, window, cx| {
+            update_in_overlay(&this, cx, |overlay, window, cx| {
                 overlay.finish(id, result, window, cx)
             })
             .ok();
@@ -376,27 +410,68 @@ impl Overlay {
                 StopReason::Other(reason) => Some(Note::Info(format!("Stopped: {reason}"))),
             };
         }
+        // The finished answer can lay out a little taller than the streamed text did.
+        self.scroll.scroll_to_bottom();
         cx.notify();
     }
 
     /// Brings the overlay back without a new capture. With a capture on hand it takes the
     /// keyboard, so the conversation can go on; otherwise it just shows the hint.
     pub fn show(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.hidden = false;
+        self.left_on_screen = false;
         let shown = if matches!(self.status, Status::Session(_)) {
-            platform::show_and_focus(window)
+            platform::show_and_focus(window, cx)
                 .and_then(|()| self.set_click_through(false, window, cx))
                 .map(|()| self.input.update(cx, |input, cx| input.focus(window, cx)))
         } else {
-            platform::show(window)
+            platform::show(window, cx)
         };
         if let Err(err) = shown {
             tracing::warn!("couldn't show the overlay: {err:#}");
         }
     }
 
+    /// The player went back to the game, or another window, without Esc.
+    ///
+    /// An answer, finished or on its way, stays on screen to be read, but the overlay
+    /// stops catching the clicks meant for the game underneath; a hotkey brings it back
+    /// (see [`Self::ask`]). With nothing to read, say a capture that was never asked about,
+    /// the overlay just goes away.
+    fn leave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Hiding the overlay takes its focus too; that isn't the player leaving it.
+        if self.hidden {
+            return;
+        }
+        let has_answer = match &self.status {
+            Status::Session(session) => {
+                session.pending.is_some()
+                    || session
+                        .conversation
+                        .turns
+                        .iter()
+                        .any(|turn| turn.role == Role::Assistant)
+            }
+            Status::Idle | Status::Capturing(_) | Status::Failed(_) => false,
+        };
+        if !has_answer {
+            self.dismiss(window, cx);
+            return;
+        }
+        self.left_on_screen = true;
+        if !self.click_through
+            && let Err(err) = self.set_click_through(true, window, cx)
+        {
+            tracing::warn!("couldn't let clicks through the overlay: {err:#}");
+        }
+    }
+
     /// Hides the overlay and hands the keyboard back to the game.
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let hidden = platform::hide(window).and_then(|()| self.set_click_through(true, window, cx));
+        self.hidden = true;
+        self.left_on_screen = false;
+        let hidden =
+            platform::hide(window, cx).and_then(|()| self.set_click_through(true, window, cx));
         if let Err(err) = hidden {
             tracing::warn!("couldn't hide the overlay: {err:#}");
         }
@@ -442,6 +517,9 @@ impl Overlay {
                     TextView::markdown(("turn", index), turn.text.clone()).into_any_element()
                 }
             });
+        // Keyed like the turn it becomes, so finishing keeps the rendered text instead of
+        // building it again.
+        let pending_index = session.conversation.turns.len();
         let pending = session.pending.as_ref().map(|pending| {
             if pending.text.is_empty() {
                 div()
@@ -450,7 +528,7 @@ impl Overlay {
                     .child("Thinking…")
                     .into_any_element()
             } else {
-                TextView::markdown("pending", pending.text.clone()).into_any_element()
+                TextView::markdown(("turn", pending_index), pending.text.clone()).into_any_element()
             }
         });
 
@@ -697,6 +775,19 @@ fn stream_answer(
         .map_err(describe)
 }
 
+/// Updates the overlay from a task started with `spawn_in` on the overlay's window.
+///
+/// Not `WeakEntity::update_in`: that passes whichever window last rendered the overlay,
+/// and the settings window renders the overlay's state too. The overlay would then show,
+/// focus and change click-through on the settings window instead of itself.
+fn update_in_overlay<R>(
+    this: &WeakEntity<Overlay>,
+    cx: &mut AsyncWindowContext,
+    update: impl FnOnce(&mut Overlay, &mut Window, &mut Context<Overlay>) -> R,
+) -> Result<R> {
+    cx.update(|window, cx| this.update(cx, |overlay, cx| update(overlay, window, cx)))?
+}
+
 /// A handle to the overlay window and its view.
 #[derive(Clone)]
 pub struct OverlayHandle {
@@ -759,7 +850,7 @@ pub fn open(cx: &mut App) -> Result<OverlayHandle> {
         cx.new(|cx| Overlay::new(window, cx))
     })?;
     window.update(cx, |_, window, cx| {
-        if let Err(err) = platform::make_frameless(window) {
+        if let Err(err) = platform::make_frameless(window, cx) {
             tracing::warn!("couldn't remove the overlay frame: {err:#}");
         }
         // gpui-kit's Root paints the theme background; the overlay draws its own panel.
@@ -767,7 +858,9 @@ pub fn open(cx: &mut App) -> Result<OverlayHandle> {
             root.style().background = Some(transparent_black().into());
         });
         // Not available everywhere (Linux, for now); the overlay then just takes clicks.
-        if let Err(err) = platform::set_click_through(window, true) {
+        if let Err(err) = view.update(cx, |overlay, cx| {
+            overlay.set_click_through(true, window, cx)
+        }) {
             tracing::warn!("click-through isn't available: {err:#}");
             view.update(cx, |overlay, _| overlay.click_through = false);
         }
