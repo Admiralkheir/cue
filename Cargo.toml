@@ -16,7 +16,7 @@ cue-core = { path = "crates/cue-core" }
 
 # gpui-kit re-exports gpui (the gpui-pre weekly Zed snapshot) plus gpui-component.
 # gpui_platform must stay on the exact gpui-pre version gpui-kit pins.
-gpui-kit = "0.7.3"
+gpui-kit = "0.8.0"
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9" }
 
 raw-window-handle = { version = "0.6", features = ["std"] }
@@ -32,13 +32,13 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
-global-hotkey = "0.8"
+global-hotkey = "0.9"
 xcap = "0.9.8"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 futures = "0.3"
 ureq = "3.4"
 keyring = "4.2"
-base64 = "0.22"
+base64 = "0.23"
 serde_json = "1"
 # Self-update: comparing release versions and checking downloads against SHA256SUMS.txt.
 semver = "1"
@@ -51,5 +51,5 @@ tracing-appender = "0.2"
 directories = "6"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-toml = "0.9"
+toml = "1.1"
 tempfile = "3"
