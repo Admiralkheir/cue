@@ -45,40 +45,40 @@ fn main() {
         let overlay = overlay::open(cx).expect("failed to open the overlay");
 
         let hotkey_config = cx.global::<AppState>().config.hotkeys.clone();
-        let started = hotkeys::start().and_then(|(mut service, presses)| {
-            let bound = service.bind(&hotkey_config);
-            match &bound {
+        let started = hotkeys::start().map(|(mut service, presses)| {
+            match service.bind(&hotkey_config) {
                 Ok(()) => tracing::info!(
                     fast = %hotkey_config.ask,
                     deep = %hotkey_config.ask_deep,
+                    show = %hotkey_config.show,
                     "hotkeys registered"
                 ),
-                Err(err) => tracing::warn!("hotkeys not registered: {err:#}"),
+                Err(err) => {
+                    tracing::warn!("hotkeys not registered: {err:#}");
+                    report_startup_error(format!("Hotkeys are disabled: {err:#}"), cx);
+                }
             }
-            // Kept even if binding failed, so new shortcuts can be set in settings.
+            // Kept, with the presses listened to, even if binding failed: shortcuts fixed
+            // in the settings then work right away.
             cx.set_global(service);
-            bound.map(|()| presses)
+            presses
         });
         match started {
             Ok(mut presses) => {
                 let overlay = overlay.clone();
                 cx.spawn(async move |cx| {
-                    while let Some(tier) = presses.next().await {
+                    while let Some(press) = presses.next().await {
                         overlay
-                            .update(cx, |overlay, window, cx| overlay.ask(tier, window, cx))
+                            .update(cx, |overlay, window, cx| match press {
+                                hotkeys::Press::Ask(tier) => overlay.ask(tier, window, cx),
+                                hotkeys::Press::Show => overlay.show(window, cx),
+                            })
                             .ok();
                     }
                 })
                 .detach();
             }
-            Err(err) => {
-                let message = format!("Hotkeys are disabled: {err:#}");
-                let state = cx.global_mut::<AppState>();
-                state.load_error = Some(match state.load_error.take() {
-                    Some(load) => format!("{load}\n{message}"),
-                    None => message,
-                });
-            }
+            Err(err) => report_startup_error(format!("Hotkeys are disabled: {err:#}"), cx),
         }
 
         // Development aid: `CUE_ASK_AFTER=3` acts as if the fast hotkey was pressed after
@@ -123,6 +123,15 @@ fn main() {
             }
         })
         .detach();
+    });
+}
+
+/// Shows `message` in the settings window, after any error from loading the config.
+fn report_startup_error(message: String, cx: &mut App) {
+    let state = cx.global_mut::<AppState>();
+    state.load_error = Some(match state.load_error.take() {
+        Some(load) => format!("{load}\n{message}"),
+        None => message,
     });
 }
 

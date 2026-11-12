@@ -55,6 +55,7 @@ pub struct Settings {
     opacity: Entity<SliderState>,
     ask_input: Entity<InputState>,
     ask_deep_input: Entity<InputState>,
+    show_input: Entity<InputState>,
     /// Bumped on every slider move, so a drag saves the config once, at the end.
     pending_saves: u64,
     message: Option<Message>,
@@ -82,6 +83,11 @@ impl Settings {
             cx.new(|cx| InputState::new(window, cx).default_value(config.hotkeys.ask.clone()));
         let ask_deep_input =
             cx.new(|cx| InputState::new(window, cx).default_value(config.hotkeys.ask_deep.clone()));
+        let show_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Off")
+                .default_value(config.hotkeys.show.clone())
+        });
         let subscriptions = vec![
             cx.subscribe_in(&fast_select, window, |this, _, event, _, cx| {
                 this.on_model_picked(Tier::Fast, event, cx)
@@ -110,6 +116,7 @@ impl Settings {
             opacity,
             ask_input,
             ask_deep_input,
+            show_input,
             pending_saves: 0,
             message: cx
                 .global::<AppState>()
@@ -358,6 +365,7 @@ impl Settings {
         let shortcuts = Hotkeys {
             ask: self.ask_input.read(cx).value().trim().to_owned(),
             ask_deep: self.ask_deep_input.read(cx).value().trim().to_owned(),
+            show: self.show_input.read(cx).value().trim().to_owned(),
         };
         let bound = if cx.has_global::<HotkeyService>() {
             cx.update_global::<HotkeyService, _>(|service, _| service.bind(&shortcuts))
@@ -366,8 +374,16 @@ impl Settings {
         };
         match bound {
             Ok(()) => {
+                let show = if shortcuts.show.is_empty() {
+                    "no shortcut to bring back the last conversation".to_owned()
+                } else {
+                    format!(
+                        "{} to bring back the last conversation",
+                        hotkeys::pretty(&shortcuts.show)
+                    )
+                };
                 let message = format!(
-                    "Shortcuts updated: {} for fast, {} for deep.",
+                    "Shortcuts updated: {} for fast, {} for deep, {show}.",
                     hotkeys::pretty(&shortcuts.ask),
                     hotkeys::pretty(&shortcuts.ask_deep)
                 );
@@ -392,6 +408,8 @@ impl Settings {
         self.ask_deep_input.update(cx, |input, cx| {
             input.set_value(defaults.ask_deep, window, cx)
         });
+        self.show_input
+            .update(cx, |input, cx| input.set_value(defaults.show, window, cx));
         self.apply_hotkeys(cx);
     }
 
@@ -452,6 +470,12 @@ impl Settings {
             .child(Input::new(&self.ask_input))
             .child(div().text_sm().child("Ask deeper"))
             .child(Input::new(&self.ask_deep_input))
+            .child(div().text_sm().child("Bring back the last conversation"))
+            .child(Input::new(&self.show_input))
+            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                "Shows the overlay again after Esc, without a new capture. Leave it empty to \
+                 turn it off.",
+            ))
             .child(
                 div()
                     .flex()
@@ -873,6 +897,14 @@ impl Render for Settings {
             hotkeys::pretty(&config.hotkeys.ask),
             hotkeys::pretty(&config.hotkeys.ask_deep),
         );
+        let show_hint = if config.hotkeys.show.is_empty() {
+            "This button brings back the last conversation without a new capture.".to_owned()
+        } else {
+            format!(
+                "{}, or this button, brings back the last conversation without a new capture.",
+                hotkeys::pretty(&config.hotkeys.show)
+            )
+        };
         let click_through = self.overlay.read(cx).click_through();
 
         div()
@@ -911,8 +943,7 @@ impl Render for Settings {
                         "Esc hides the overlay. {ask} or {ask_deep} captures the game and brings it \
                          back. Going back to the game without Esc leaves the answer on screen, with \
                          clicks passing through; a hotkey then brings that conversation back, and \
-                         another press captures anew. This button brings back the last \
-                         conversation without a new capture."
+                         another press captures anew. {show_hint}"
                     )))
                     .child(
                         Button::new("show-overlay")

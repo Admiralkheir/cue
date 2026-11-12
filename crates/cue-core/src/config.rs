@@ -32,6 +32,8 @@ pub struct Hotkeys {
     pub ask: String,
     /// Capture the game and ask with the deep model.
     pub ask_deep: String,
+    /// Bring back the last conversation without a new capture. Empty turns it off.
+    pub show: String,
 }
 
 impl Default for Hotkeys {
@@ -39,6 +41,7 @@ impl Default for Hotkeys {
         Self {
             ask: "CmdOrCtrl+Shift+Space".into(),
             ask_deep: "CmdOrCtrl+Shift+Enter".into(),
+            show: "CmdOrCtrl+Shift+Backspace".into(),
         }
     }
 }
@@ -360,5 +363,15 @@ mod tests {
             Config::load_from(&path),
             Err(ConfigError::Parse { .. })
         ));
+    }
+
+    #[test]
+    fn older_configs_get_the_show_shortcut() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[hotkeys]\nask = \"Alt+Q\"\nask_deep = \"Alt+W\"\n").unwrap();
+        let hotkeys = Config::load_from(&path).unwrap().hotkeys;
+        assert_eq!(hotkeys.ask, "Alt+Q");
+        assert_eq!(hotkeys.show, Hotkeys::default().show);
     }
 }

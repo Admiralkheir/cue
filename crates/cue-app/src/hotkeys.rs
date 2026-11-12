@@ -9,41 +9,50 @@ use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use gpui_kit::Global;
 
+/// What a shortcut asks the overlay to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Press {
+    /// Capture the game and ask with this tier.
+    Ask(Tier),
+    /// Bring back the last conversation without a new capture.
+    Show,
+}
+
 /// Owns the registered shortcuts; they stay registered while this lives.
 pub struct HotkeyService {
     manager: GlobalHotKeyManager,
     active: Vec<HotKey>,
-    /// Which tier each registered shortcut asks with, read by the event handler.
-    tiers: Arc<Mutex<Vec<(u32, Tier)>>>,
+    /// What each registered shortcut does, read by the event handler.
+    actions: Arc<Mutex<Vec<(u32, Press)>>>,
 }
 
 impl Global for HotkeyService {}
 
-/// Starts listening and returns a stream with one tier per key press. Nothing is bound
-/// until [`HotkeyService::bind`]. Must be called on the main thread.
-pub fn start() -> Result<(HotkeyService, mpsc::UnboundedReceiver<Tier>)> {
+/// Starts listening and returns a stream with one [`Press`] per key press. Nothing is
+/// bound until [`HotkeyService::bind`]. Must be called on the main thread.
+pub fn start() -> Result<(HotkeyService, mpsc::UnboundedReceiver<Press>)> {
     let manager = GlobalHotKeyManager::new().context("couldn't start the hotkey listener")?;
-    let tiers: Arc<Mutex<Vec<(u32, Tier)>>> = Arc::default();
+    let actions: Arc<Mutex<Vec<(u32, Press)>>> = Arc::default();
     let (presses, receiver) = mpsc::unbounded();
 
-    let handler_tiers = tiers.clone();
+    let handler_actions = actions.clone();
     GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
         if event.state() != HotKeyState::Pressed {
             return;
         }
-        let tiers = handler_tiers
+        let actions = handler_actions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(&(_, tier)) = tiers.iter().find(|(id, _)| *id == event.id()) {
+        if let Some(&(_, press)) = actions.iter().find(|(id, _)| *id == event.id()) {
             // Fails only once the app is shutting down and the receiver is gone.
-            let _ = presses.unbounded_send(tier);
+            let _ = presses.unbounded_send(press);
         }
     }));
 
     let service = HotkeyService {
         manager,
         active: Vec::new(),
-        tiers,
+        actions,
     };
     Ok((service, receiver))
 }
@@ -52,16 +61,32 @@ impl HotkeyService {
     /// Swaps in the shortcuts from `config`. If they can't all be registered, the
     /// previous ones stay in place.
     pub fn bind(&mut self, config: &Hotkeys) -> Result<()> {
-        let ask = parse(&config.ask)?;
-        let ask_deep = parse(&config.ask_deep)?;
-        if ask == ask_deep {
-            bail!("the fast and deep shortcuts must be different");
+        let mut wanted = vec![
+            (parse(&config.ask)?, &config.ask, Press::Ask(Tier::Fast)),
+            (
+                parse(&config.ask_deep)?,
+                &config.ask_deep,
+                Press::Ask(Tier::Deep),
+            ),
+        ];
+        // The show shortcut is optional; leaving it empty turns it off.
+        if !config.show.trim().is_empty() {
+            wanted.push((parse(&config.show)?, &config.show, Press::Show));
+        }
+        for (i, (hotkey, text, _)) in wanted.iter().enumerate() {
+            if wanted[..i].iter().any(|(other, ..)| other == hotkey) {
+                bail!(
+                    "{} is used for two shortcuts; each needs its own",
+                    pretty(text)
+                );
+            }
         }
 
         let _ = self.manager.unregister_all(&self.active);
-        for (hotkey, text) in [(ask, &config.ask), (ask_deep, &config.ask_deep)] {
-            if let Err(err) = self.manager.register(hotkey) {
-                let _ = self.manager.unregister_all(&[ask, ask_deep]);
+        let mut registered = Vec::new();
+        for (hotkey, text, _) in &wanted {
+            if let Err(err) = self.manager.register(*hotkey) {
+                let _ = self.manager.unregister_all(&registered);
                 let _ = self.manager.register_all(&self.active);
                 return Err(err).with_context(|| {
                     format!(
@@ -70,14 +95,17 @@ impl HotkeyService {
                     )
                 });
             }
+            registered.push(*hotkey);
         }
 
-        self.active = vec![ask, ask_deep];
+        self.active = registered;
         *self
-            .tiers
+            .actions
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            vec![(ask.id(), Tier::Fast), (ask_deep.id(), Tier::Deep)];
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = wanted
+            .iter()
+            .map(|(hotkey, _, press)| (hotkey.id(), *press))
+            .collect();
         Ok(())
     }
 }
