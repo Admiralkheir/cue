@@ -27,7 +27,7 @@ jobs:
     # Linux support is experimental, so it doesn't fail the run yet.
     continue-on-error: ${{ matrix.os == 'ubuntu-latest' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - if: runner.os == 'Linux'
         run: scripts/install-linux-deps.sh
       - uses: dtolnay/rust-toolchain@stable
@@ -50,7 +50,7 @@ jobs:
     name: Licenses and advisories
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses advisories bans sources
