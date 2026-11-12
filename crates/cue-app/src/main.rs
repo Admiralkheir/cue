@@ -11,6 +11,7 @@ mod platform;
 mod settings;
 mod single_instance;
 mod themes;
+mod tray;
 mod updates;
 
 use cue_core::Tier;
@@ -31,7 +32,7 @@ fn main() {
             "restarted after an update"
         );
     }
-    let Some(mut show_requests) = single_instance::claim(relaunched) else {
+    let Some(show_requests) = single_instance::claim(relaunched) else {
         tracing::info!("Cue is already running; asked it to show its settings");
         return;
     };
@@ -107,9 +108,34 @@ fn main() {
         // The settings window, open on every start, shows what the check finds.
         updates::on_startup(cx);
 
-        // Launching Cue again brings the settings back, reopening them if they were closed.
+        // Closing the settings leaves Cue running for the hotkeys; the tray icon brings them
+        // back, and is where Cue is quit for good.
+        let (mut tray, tray_requests) = match tray::start() {
+            Some((tray, requests)) => (Some(tray), Some(requests)),
+            None => (None, None),
+        };
+        // Removed while quitting, by any route: Windows leaves the icon of an exited app in
+        // the notification area until the mouse passes over it.
+        cx.on_app_quit(move |_| {
+            drop(tray.take());
+            async {}
+        })
+        .detach();
+        let launches = show_requests.map(|()| tray::Request::ShowSettings);
+        let mut requests = match tray_requests {
+            Some(tray_requests) => futures::stream::select(launches, tray_requests).boxed_local(),
+            None => launches.boxed_local(),
+        };
+
+        // Launching Cue again, or the tray icon, brings the settings back, reopening them if
+        // they were closed.
         cx.spawn(async move |cx| {
-            while show_requests.next().await.is_some() {
+            while let Some(request) = requests.next().await {
+                if request == tray::Request::Quit {
+                    tracing::info!("quitting from the tray icon");
+                    cx.update(|cx| cx.quit());
+                    break;
+                }
                 let shown =
                     settings.update(cx, |_, window, cx| platform::show_and_focus(window, cx));
                 match shown {
