@@ -27,7 +27,7 @@ jobs:
           tool: cargo-about
       - run: cargo about generate about.hbs --output-file THIRD_PARTY_LICENSES.html
       - run: scripts/package-macos.sh dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cue-macos
           path: dist/*.zip
@@ -52,7 +52,7 @@ jobs:
           mkdir -p dist/Cue
           cp target/release/cue.exe LICENSE THIRD_PARTY_LICENSES.html dist/Cue/
           (cd dist && 7z a "Cue-$version-windows-x64.zip" Cue > /dev/null)
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cue-windows
           path: dist/*.zip
@@ -77,7 +77,7 @@ jobs:
           mkdir -p dist/cue
           cp target/release/cue assets/cue.png packaging/linux/cue.desktop LICENSE THIRD_PARTY_LICENSES.html dist/cue/
           tar -C dist -czf "dist/cue-$version-linux-x86_64.tar.gz" cue
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cue-linux
           path: dist/*.tar.gz
