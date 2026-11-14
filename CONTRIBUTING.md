@@ -21,7 +21,9 @@ cargo run -p cue-app
 
 - **macOS:** the Xcode Command Line Tools are enough; Metal shaders are compiled at
   startup. Grant the terminal (or the built app) Screen Recording permission in System
-  Settings so Cue can capture windows. `scripts/package-macos.sh` builds `Cue.app`.
+  Settings so Cue can capture windows. `scripts/package-macos.sh` builds `Cue.app`; run
+  `scripts/macos-signing-cert.sh` once first, or each rebuilt `Cue.app` loses its Screen
+  Recording permission (see `packaging/macos/SIGNING.md`).
 - **Windows:** use the MSVC toolchain. Cue captures with Windows Graphics Capture.
 - **Linux (experimental):** run `scripts/install-linux-deps.sh` on Debian/Ubuntu first.
 

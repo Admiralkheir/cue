@@ -16,6 +16,12 @@ const MIN_HEIGHT: u32 = 240;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
+    #[error(
+        "Cue isn't allowed to record the screen. Turn Cue on in System Settings > Privacy & \
+         Security > Screen & System Audio Recording, then quit and reopen Cue. If it's \
+         already on there, remove it with − and allow it again"
+    )]
+    NoScreenAccess,
     #[error("no game window found; bring the game to the front and try again")]
     NoTarget,
     #[error("screen capture failed: {0}")]
@@ -98,6 +104,10 @@ pub fn capture_focused_window(
     own_pid: u32,
     frontmost_pid: Option<u32>,
 ) -> Result<Capture, CaptureError> {
+    #[cfg(target_os = "macos")]
+    if !screen_access::allowed() {
+        return Err(CaptureError::NoScreenAccess);
+    }
     let windows = Window::all()?;
     let infos: Vec<WindowInfo> = windows
         .iter()
@@ -114,6 +124,31 @@ pub fn capture_focused_window(
         source_height,
         frame: encode_jpeg(image, MAX_LONG_EDGE)?,
     })
+}
+
+#[cfg(target_os = "macos")]
+mod screen_access {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
+        fn CGRequestScreenCaptureAccess() -> bool;
+    }
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static ASKED: AtomicBool = AtomicBool::new(false);
+
+    /// Whether Cue may record the screen. Without asking, macOS neither prompts nor lists
+    /// Cue under Screen Recording, so the user would have no way to allow it: asking shows
+    /// macOS's prompt and adds Cue to that list. Asked once per run, since after a refusal
+    /// macOS answers by bringing System Settings forward, over the game.
+    pub fn allowed() -> bool {
+        // SAFETY: both take no arguments and only read or request this app's permission.
+        unsafe {
+            CGPreflightScreenCaptureAccess()
+                || (!ASKED.swap(true, Ordering::Relaxed) && CGRequestScreenCaptureAccess())
+        }
+    }
 }
 
 /// On Windows, xcap falls back to the executable's full path when it can't read an app's

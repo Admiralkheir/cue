@@ -45,6 +45,7 @@ jobs:
     # Downloadable builds of main for every platform; see package.yml.
     if: github.event_name != 'pull_request'
     uses: ./.github/workflows/package.yml
+    secrets: inherit
 
   dependencies:
     name: Licenses and advisories
