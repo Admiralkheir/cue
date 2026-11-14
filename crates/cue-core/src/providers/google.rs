@@ -1,11 +1,8 @@
 //! Google's Gemini API, with an API key from Google AI Studio.
 
-use std::ops::ControlFlow;
-
-use super::{Completion, Gemini, Provider, ProviderError, http};
+use super::{Completion, Gemini, OnEvent, Options, Provider, ProviderError, http};
 use crate::conversation::Conversation;
 use crate::provider::ModelInfo;
-use crate::recommend::Tier;
 
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -63,11 +60,11 @@ impl Provider for GoogleAi {
     fn stream(
         &self,
         model: &str,
-        tier: Tier,
+        options: Options<'_>,
         conversation: &Conversation,
-        on_text: &mut dyn FnMut(&str) -> ControlFlow<()>,
+        on_event: &mut OnEvent<'_>,
     ) -> Result<Completion, ProviderError> {
-        self.gemini.stream(model, tier, conversation, on_text)
+        self.gemini.stream(model, options, conversation, on_event)
     }
 }
 

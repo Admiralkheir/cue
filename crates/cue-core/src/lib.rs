@@ -1,5 +1,5 @@
 //! UI-independent core of Cue: configuration, game profiles, provider accounts and their
-//! clients, model recommendations, API key storage and screen capture.
+//! clients, model recommendations, web search, API key storage and screen capture.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,14 +11,18 @@ pub mod games;
 pub mod provider;
 pub mod providers;
 pub mod recommend;
+pub mod search;
 pub mod secrets;
 pub mod update;
 
 pub use capture::{Capture, CaptureError, EncodedFrame, capture_focused_window};
-pub use config::{Config, ConfigError, Hotkeys, OverlayPosition, OverlaySettings, UpdateSettings};
+pub use config::{
+    AnswerSettings, Config, ConfigError, Hotkeys, OverlayPosition, OverlaySettings, UpdateSettings,
+    WebSearchMode,
+};
 pub use conversation::{Conversation, Role, Turn};
 pub use games::{GameProfile, find_profile};
-pub use provider::{ModelInfo, ModelRef, ProviderAccount, ProviderKind};
+pub use provider::{Effort, ModelInfo, ModelRef, ProviderAccount, ProviderKind};
 pub use recommend::{AccountModels, Tier, recommend};
 
 /// An id unique within this run and, through the timestamp, practically across runs.

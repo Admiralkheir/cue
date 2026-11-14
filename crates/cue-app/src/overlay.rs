@@ -6,10 +6,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
-use cue_core::providers::{self, Completion, ProviderError, StopReason};
+use cue_core::providers::{self, Completion, Event, Options, ProviderError, Search, StopReason};
+use cue_core::search::SearxNg;
 use cue_core::{
-    Capture, Conversation, OverlayPosition, ProviderAccount, Role, Tier, capture_focused_window,
-    secrets,
+    AnswerSettings, Capture, Conversation, OverlayPosition, ProviderAccount, Role, Tier,
+    WebSearchMode, capture_focused_window, secrets,
 };
 use futures::StreamExt;
 use futures::channel::mpsc;
@@ -51,7 +52,15 @@ struct Session {
 
 struct Pending {
     text: String,
+    /// A web search is running: its query, or an empty one when the provider doesn't say.
+    searching: Option<String>,
     cancel: Arc<AtomicBool>,
+}
+
+/// What the request thread sends back while the answer streams in.
+enum Update {
+    Text(String),
+    Searching(Option<String>),
 }
 
 enum Note {
@@ -313,26 +322,34 @@ impl Overlay {
         let cancel = Arc::new(AtomicBool::new(false));
         session.pending = Some(Pending {
             text: String::new(),
+            searching: None,
             cancel: cancel.clone(),
         });
         session.note = None;
         let (id, tier, conversation) = (session.id, session.tier, session.conversation.clone());
+        let answers = config.answers.clone();
         self.input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.scroll.scroll_to_bottom();
         cx.notify();
 
-        let (deltas_tx, mut deltas) = mpsc::unbounded::<String>();
+        let (updates_tx, mut updates) = mpsc::unbounded::<Update>();
         // Shown under the answer, so it's clear which key paid for it.
         let label = format!("{model} · {}", account.display_name());
         let request = cx.background_spawn(async move {
-            request_answer(&account, &model, tier, &conversation, &cancel, &deltas_tx)
-                .map(|completion| (label, completion))
+            let question = Question {
+                account: &account,
+                model: &model,
+                tier,
+                answers: &answers,
+                conversation: &conversation,
+            };
+            request_answer(question, &cancel, &updates_tx).map(|completion| (label, completion))
         });
         cx.spawn_in(window, async move |this, cx| {
-            while let Some(piece) = deltas.next().await {
+            while let Some(update) = updates.next().await {
                 if this
-                    .update(cx, |overlay, cx| overlay.append(id, &piece, cx))
+                    .update(cx, |overlay, cx| overlay.apply(id, update, cx))
                     .is_err()
                 {
                     return;
@@ -347,15 +364,22 @@ impl Overlay {
         .detach();
     }
 
-    fn append(&mut self, id: u64, piece: &str, cx: &mut Context<Self>) {
-        if let Some(pending) = self
+    fn apply(&mut self, id: u64, update: Update, cx: &mut Context<Self>) {
+        let Some(pending) = self
             .session_mut(id)
             .and_then(|session| session.pending.as_mut())
-        {
-            pending.text.push_str(piece);
-            self.scroll.scroll_to_bottom();
-            cx.notify();
+        else {
+            return;
+        };
+        match update {
+            Update::Text(piece) => {
+                pending.searching = None;
+                pending.text.push_str(&piece);
+            }
+            Update::Searching(query) => pending.searching = Some(query.unwrap_or_default()),
         }
+        self.scroll.scroll_to_bottom();
+        cx.notify();
     }
 
     fn finish(
@@ -395,10 +419,17 @@ impl Overlay {
         };
         if let Some((label, Completion { stop, usage })) = completion {
             session.note = match stop {
-                StopReason::EndTurn => Some(Note::Info(format!(
-                    "{label} · {} in / {} out tokens",
-                    usage.input_tokens, usage.output_tokens
-                ))),
+                StopReason::EndTurn => {
+                    let searches = match usage.web_searches {
+                        0 => String::new(),
+                        1 => " · 1 web search".to_owned(),
+                        count => format!(" · {count} web searches"),
+                    };
+                    Some(Note::Info(format!(
+                        "{label} · {} in / {} out tokens{searches}",
+                        usage.input_tokens, usage.output_tokens
+                    )))
+                }
                 StopReason::MaxTokens => {
                     Some(Note::Error("The answer hit the length limit.".into()))
                 }
@@ -521,15 +552,22 @@ impl Overlay {
         // building it again.
         let pending_index = session.conversation.turns.len();
         let pending = session.pending.as_ref().map(|pending| {
-            if pending.text.is_empty() {
-                div()
-                    .text_sm()
-                    .text_color(rgb(theme.muted))
-                    .child("Thinking…")
-                    .into_any_element()
-            } else {
-                TextView::markdown(("turn", pending_index), pending.text.clone()).into_any_element()
-            }
+            let status = match pending.searching.as_deref() {
+                Some("") => Some("Searching the web…".to_owned()),
+                Some(query) => Some(format!("Searching the web for “{query}”…")),
+                None if pending.text.is_empty() => Some("Thinking…".to_owned()),
+                None => None,
+            };
+            let status =
+                status.map(|status| div().text_sm().text_color(rgb(theme.muted)).child(status));
+            let text = (!pending.text.is_empty())
+                .then(|| TextView::markdown(("turn", pending_index), pending.text.clone()));
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .children(text)
+                .children(status)
         });
 
         div()
@@ -688,22 +726,48 @@ impl Render for Overlay {
     }
 }
 
+/// Everything one request needs to know.
+struct Question<'a> {
+    account: &'a ProviderAccount,
+    model: &'a str,
+    tier: Tier,
+    answers: &'a AnswerSettings,
+    conversation: &'a Conversation,
+}
+
 /// Runs one streamed request on a background thread, forwarding text as it arrives.
 fn request_answer(
-    account: &ProviderAccount,
-    model: &str,
-    tier: Tier,
-    conversation: &Conversation,
+    question: Question<'_>,
     cancel: &AtomicBool,
-    deltas: &mpsc::UnboundedSender<String>,
+    updates: &mpsc::UnboundedSender<Update>,
 ) -> Result<Completion, String> {
+    let Question {
+        account,
+        model,
+        tier,
+        answers,
+        conversation,
+    } = question;
     let name = account.display_name();
     let provider = account.kind.slug();
+    let effort = answers.effort(tier);
+    let searxng =
+        (answers.web_search == WebSearchMode::Searxng).then(|| SearxNg::new(&answers.searxng_url));
+    let options = Options {
+        effort,
+        search: match (&searxng, answers.web_search) {
+            (Some(searxng), _) => Search::Tool(searxng),
+            (None, WebSearchMode::Provider) => Search::Provider,
+            (None, _) => Search::Off,
+        },
+    };
     let started = std::time::Instant::now();
     tracing::info!(
         provider,
         model,
         ?tier,
+        ?effort,
+        web_search = ?answers.web_search,
         turns = conversation.turns.len(),
         "asking"
     );
@@ -727,15 +791,7 @@ fn request_answer(
         .map_err(|err| format!("{name}: {err}"))
         .and_then(|key| providers::connect(account, key).map_err(describe))
         .and_then(|client| {
-            stream_answer(
-                &*client,
-                model,
-                tier,
-                conversation,
-                cancel,
-                deltas,
-                describe,
-            )
+            stream_answer(&*client, model, options, conversation, cancel, updates).map_err(describe)
         });
     let elapsed_ms = started.elapsed().as_millis() as u64;
     match &result {
@@ -745,6 +801,7 @@ fn request_answer(
             stop = ?completion.stop,
             input_tokens = completion.usage.input_tokens,
             output_tokens = completion.usage.output_tokens,
+            web_searches = completion.usage.web_searches,
             elapsed_ms,
             "answered"
         ),
@@ -756,23 +813,22 @@ fn request_answer(
 fn stream_answer(
     client: &dyn providers::Provider,
     model: &str,
-    tier: Tier,
+    options: Options<'_>,
     conversation: &Conversation,
     cancel: &AtomicBool,
-    deltas: &mpsc::UnboundedSender<String>,
-    describe: impl Fn(ProviderError) -> String,
-) -> Result<Completion, String> {
-    client
-        .stream(model, tier, conversation, &mut |piece| {
-            let stopped =
-                cancel.load(Ordering::Relaxed) || deltas.unbounded_send(piece.to_owned()).is_err();
-            if stopped {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        })
-        .map_err(describe)
+    updates: &mpsc::UnboundedSender<Update>,
+) -> Result<Completion, ProviderError> {
+    client.stream(model, options, conversation, &mut |event| {
+        let update = match event {
+            Event::Text(piece) => Update::Text(piece.to_owned()),
+            Event::Searching(query) => Update::Searching(query.map(str::to_owned)),
+        };
+        if cancel.load(Ordering::Relaxed) || updates.unbounded_send(update).is_err() {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
 }
 
 /// Updates the overlay from a task started with `spawn_in` on the overlay's window.

@@ -1,12 +1,13 @@
 //! Clients for the AI providers. Calls block, so run them off the UI thread.
 
+mod answer;
 mod anthropic;
 mod chat_completions;
 mod gemini;
 mod google;
 pub(crate) mod http;
 #[cfg(test)]
-mod mock;
+pub(crate) mod mock;
 mod openai;
 mod opencode;
 mod responses;
@@ -24,8 +25,7 @@ pub use opencode::{OpenCode, Plan};
 pub use responses::Responses;
 
 use crate::conversation::Conversation;
-use crate::provider::{ModelInfo, ProviderAccount, ProviderKind};
-use crate::recommend::Tier;
+use crate::provider::{Effort, ModelInfo, ProviderAccount, ProviderKind};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
@@ -58,7 +58,54 @@ pub enum StopReason {
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Web searches made for the answer, by the provider or through Cue's search tool.
+    pub web_searches: u32,
 }
+
+impl Usage {
+    fn add(&mut self, other: Usage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.web_searches += other.web_searches;
+    }
+}
+
+/// A search engine the model can call as a tool, like a local SearXNG.
+pub trait WebSearch: Send + Sync {
+    /// Results for `query` as text for the model to read.
+    fn search(&self, query: &str) -> Result<String, String>;
+}
+
+/// Whether and how the model may search the web.
+#[derive(Clone, Copy, Default)]
+pub enum Search<'a> {
+    #[default]
+    Off,
+    /// The provider's own search tool, billed by the provider per search. Models in formats
+    /// without one answer without searching.
+    Provider,
+    /// A search engine Cue calls on the model's behalf.
+    Tool(&'a dyn WebSearch),
+}
+
+/// How to answer, beyond which model and what to answer.
+#[derive(Clone, Copy, Default)]
+pub struct Options<'a> {
+    pub effort: Effort,
+    pub search: Search<'a>,
+}
+
+/// What a stream reports as it goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event<'a> {
+    /// A piece of the answer.
+    Text(&'a str),
+    /// The model started a web search, for this query when the provider says.
+    Searching(Option<&'a str>),
+}
+
+/// Gets each [`Event`] and can stop the stream by returning `Break`.
+pub type OnEvent<'a> = dyn FnMut(Event<'_>) -> ControlFlow<()> + 'a;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
@@ -70,14 +117,14 @@ pub trait Provider: Send + Sync {
     /// Models this key can use.
     fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError>;
 
-    /// Streams the answer to the conversation's last user turn. `on_text` gets each
-    /// piece of text as it arrives and can stop the stream by returning `Break`.
+    /// Streams the answer to the conversation's last user turn. `on_event` gets each
+    /// piece of text as it arrives, and each web search the model starts.
     fn stream(
         &self,
         model: &str,
-        tier: Tier,
+        options: Options<'_>,
         conversation: &Conversation,
-        on_text: &mut dyn FnMut(&str) -> ControlFlow<()>,
+        on_event: &mut OnEvent<'_>,
     ) -> Result<Completion, ProviderError>;
 }
 
@@ -109,10 +156,11 @@ pub fn connect(
     }
 }
 
-/// Output budget per tier. Thinking counts against it, so the fast tier isn't tiny.
-fn max_tokens(tier: Tier) -> u32 {
-    match tier {
-        Tier::Fast => 4_096,
-        Tier::Deep => 16_000,
+/// Output budget per request. Thinking counts against it, so even low effort isn't tiny.
+fn max_tokens(effort: Effort) -> u32 {
+    match effort {
+        Effort::Low => 4_096,
+        Effort::Medium => 8_192,
+        Effort::High | Effort::Default => 16_000,
     }
 }

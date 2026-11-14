@@ -17,7 +17,9 @@ the game.
   Google Gemini, OpenCode Zen or OpenCode Go; local Ollama is planned). Cue lists the
   models each key can reach and suggests a pick per tier, but you choose.
 - **Two tiers.** A *fast* model for quick in-game questions and a *deep* model for
-  strategy, each with its own hotkey.
+  strategy, each with its own hotkey and its own thinking effort.
+- **Optional web search.** Off by default. Turn on your provider's own search (billed per
+  search) or point Cue at a SearXNG instance you run yourself, for free.
 - **You decide what leaves your machine.** Cue captures only when you press the hotkey.
   Keys are stored in the OS keychain. No telemetry.
 
@@ -29,6 +31,7 @@ the game.
 - [x] Streaming answers with follow-up questions on the same capture
 - [x] Game detection from the active window, plus per-game profiles (notes and models)
 - [x] Providers: Anthropic, OpenAI, Google Gemini, OpenCode Zen and OpenCode Go
+- [x] Thinking effort per tier, and web search through the provider or SearXNG
 - [ ] Local models through Ollama
 
 Windows and macOS are both first-class targets; so far Cue has been run on macOS and

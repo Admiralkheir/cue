@@ -117,3 +117,39 @@ fn read_request(reader: &mut impl BufRead) -> Request {
         body: String::from_utf8(body).unwrap(),
     }
 }
+
+/// A streamed response with one server-sent event per payload. Payloads may span lines
+/// for readability; each is sent on one.
+pub fn sse(events: &[&str]) -> Reply {
+    let body: String = events
+        .iter()
+        .map(|data| format!("event: x\ndata: {}\n\n", data.replace('\n', " ")))
+        .collect();
+    Reply::new(200, "text/event-stream", body)
+}
+
+/// A search tool that answers every query the same way and records the queries.
+pub struct FakeSearch {
+    results: String,
+    queries: Mutex<Vec<String>>,
+}
+
+impl FakeSearch {
+    pub fn new(results: &str) -> Self {
+        Self {
+            results: results.into(),
+            queries: Mutex::default(),
+        }
+    }
+
+    pub fn queries(&self) -> Vec<String> {
+        self.queries.lock().unwrap().clone()
+    }
+}
+
+impl super::WebSearch for FakeSearch {
+    fn search(&self, query: &str) -> Result<String, String> {
+        self.queries.lock().unwrap().push(query.to_owned());
+        Ok(self.results.clone())
+    }
+}

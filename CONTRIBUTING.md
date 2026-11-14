@@ -57,6 +57,9 @@ the detail. Never log API keys, screenshots, questions, answers or window titles
   seconds after launch.
 - `cargo run -p cue-core --example capture -- out.jpg 3` captures the frontmost window
   after three seconds, the same way the hotkey does, and saves the JPEG.
+- `cargo run -p cue-core --example ask -- --model claude-haiku-5-5 --effort medium --search searxng "question"`
+  asks a real model with a key from your config, the way the overlay does, and prints the
+  answer, each web search and the usage. Every run is billed to that key.
 
 ## Layout
 
