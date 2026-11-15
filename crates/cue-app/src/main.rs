@@ -117,6 +117,8 @@ fn main() {
         // Removed while quitting, by any route: Windows leaves the icon of an exited app in
         // the notification area until the mouse passes over it.
         cx.on_app_quit(move |_| {
+            // On Linux `Tray` holds nothing, so there's nothing for the drop to do there.
+            #[allow(clippy::drop_non_drop)]
             drop(tray.take());
             async {}
         })
