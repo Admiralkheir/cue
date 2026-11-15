@@ -1,11 +1,8 @@
 //! OpenAI's own API: models listed from `/v1/models`, answers through the Responses API.
 
-use std::ops::ControlFlow;
-
-use super::{Completion, Provider, ProviderError, Responses, http};
+use super::{Completion, OnEvent, Options, Provider, ProviderError, Responses, http};
 use crate::conversation::Conversation;
 use crate::provider::ModelInfo;
-use crate::recommend::Tier;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
@@ -73,11 +70,12 @@ impl Provider for OpenAi {
     fn stream(
         &self,
         model: &str,
-        tier: Tier,
+        options: Options<'_>,
         conversation: &Conversation,
-        on_text: &mut dyn FnMut(&str) -> ControlFlow<()>,
+        on_event: &mut OnEvent<'_>,
     ) -> Result<Completion, ProviderError> {
-        self.responses.stream(model, tier, conversation, on_text)
+        self.responses
+            .stream(model, options, conversation, on_event)
     }
 }
 

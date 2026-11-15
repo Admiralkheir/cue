@@ -1,15 +1,20 @@
 //! The OpenAI-compatible Chat Completions format, which most gateways and open-model
 //! hosts speak.
+//!
+//! There's no common way to set reasoning effort or to search the web built into this
+//! format, so those settings don't apply here, except for Cue's own search tool, which goes
+//! through function calling.
 
+use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
 use serde_json::{Value, json};
 
+use super::answer::{self, Answer, TOOL_DESCRIPTION, TOOL_NAME};
 use super::http::{self, error_message};
-use super::{Completion, ProviderError, StopReason, Usage, max_tokens};
+use super::{Completion, OnEvent, Options, ProviderError, Search, StopReason, Usage, max_tokens};
 use crate::capture::EncodedFrame;
 use crate::conversation::{Conversation, Role};
-use crate::recommend::Tier;
 
 pub struct ChatCompletions {
     /// The full `.../chat/completions` URL.
@@ -38,31 +43,72 @@ impl ChatCompletions {
     pub fn stream(
         &self,
         model: &str,
-        tier: Tier,
+        options: Options<'_>,
         conversation: &Conversation,
-        on_text: &mut dyn FnMut(&str) -> ControlFlow<()>,
+        on_event: &mut OnEvent<'_>,
     ) -> Result<Completion, ProviderError> {
-        let body = json!({
-            "model": model,
-            "max_tokens": max_tokens(tier),
-            "stream": true,
-            "stream_options": { "include_usage": true },
-            "messages": messages(conversation),
-        });
-        let mut request = self
-            .agent
-            .post(&self.endpoint)
-            .header("authorization", &format!("Bearer {}", self.api_key));
-        if let Some(name) = self.session_header {
-            request = request.header(name, &conversation.id);
+        let has_tool = matches!(options.search, Search::Tool(_));
+        let mut answer = Answer::new(options.search, on_event);
+        let mut messages = messages(conversation, has_tool);
+        loop {
+            answer.next_round()?;
+            let mut body = json!({
+                "model": model,
+                "max_tokens": max_tokens(options.effort),
+                "stream": true,
+                "stream_options": { "include_usage": true },
+                "messages": messages,
+            });
+            if has_tool {
+                body["tools"] = json!([{
+                    "type": "function",
+                    "function": {
+                        "name": TOOL_NAME,
+                        "description": TOOL_DESCRIPTION,
+                        "parameters": answer::tool_parameters(),
+                    },
+                }]);
+            }
+            let mut request = self
+                .agent
+                .post(&self.endpoint)
+                .header("authorization", &format!("Bearer {}", self.api_key));
+            if let Some(name) = self.session_header {
+                request = request.header(name, &conversation.id);
+            }
+            let mut response = http::send_json(request, &body)?;
+            let (text, calls) = match read_stream(&mut response, &mut answer)? {
+                Round::Done(stop) => return Ok(answer.finish(stop)),
+                Round::ToolCalls { text, calls } => (text, calls),
+            };
+            let mut results = Vec::new();
+            for call in &calls {
+                let Some(result) = answer.call_tool(&answer::parse_arguments(&call.arguments))
+                else {
+                    return Ok(answer.finish(StopReason::Other("tool_calls".into())));
+                };
+                let ControlFlow::Continue(result) = result else {
+                    return Ok(answer.finish(StopReason::Cancelled));
+                };
+                results.push(json!({ "role": "tool", "tool_call_id": call.id, "content": result }));
+            }
+            messages.push(json!({
+                "role": "assistant",
+                "content": (!text.is_empty()).then_some(text),
+                "tool_calls": calls.iter().map(|call| json!({
+                    "id": call.id,
+                    "type": "function",
+                    "function": { "name": call.name, "arguments": call.arguments },
+                })).collect::<Vec<_>>(),
+            }));
+            messages.extend(results);
         }
-        let mut body = http::send_json(request, &body)?;
-        read_stream(&mut body, on_text)
     }
 }
 
-fn messages(conversation: &Conversation) -> Vec<Value> {
-    let mut messages = vec![json!({ "role": "system", "content": conversation.system })];
+fn messages(conversation: &Conversation, can_search: bool) -> Vec<Value> {
+    let system = answer::system_prompt(&conversation.system, can_search);
+    let mut messages = vec![json!({ "role": "system", "content": system })];
     let mut image = conversation.image.as_ref();
     messages.extend(conversation.turns.iter().map(|turn| match turn.role {
         Role::User => {
@@ -83,12 +129,31 @@ fn image_part(frame: &EncodedFrame) -> Value {
     json!({ "type": "image_url", "image_url": { "url": http::data_url(frame) } })
 }
 
+/// A tool call put together from its streamed pieces.
+#[derive(Debug, Default)]
+struct ToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+enum Round {
+    Done(StopReason),
+    /// The model called Cue's search tool, after writing `text`.
+    ToolCalls {
+        text: String,
+        calls: Vec<ToolCall>,
+    },
+}
+
 fn read_stream(
     body: &mut ureq::Body,
-    on_text: &mut dyn FnMut(&str) -> ControlFlow<()>,
-) -> Result<Completion, ProviderError> {
+    answer: &mut Answer<'_, '_, '_>,
+) -> Result<Round, ProviderError> {
     let mut usage = Usage::default();
     let mut stop = None;
+    let mut text = String::new();
+    let mut calls: BTreeMap<u64, ToolCall> = BTreeMap::new();
 
     for chunk in http::json_events(body) {
         let Some(chunk) = chunk? else { break };
@@ -103,20 +168,36 @@ fn read_stream(
         let Some(choice) = chunk["choices"].get(0) else {
             continue;
         };
+        let delta = &choice["delta"];
         // Reasoning models may also stream `reasoning_content`; only the answer is shown.
-        if let Some(text) = choice["delta"]["content"]
-            .as_str()
-            .filter(|text| !text.is_empty())
-            && on_text(text).is_break()
+        if let Some(piece) = delta["content"].as_str() {
+            text.push_str(piece);
+            if answer.text(piece).is_break() {
+                answer.add_usage(usage);
+                return Ok(Round::Done(StopReason::Cancelled));
+            }
+        }
+        for piece in delta["tool_calls"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
         {
-            return Ok(Completion {
-                stop: StopReason::Cancelled,
-                usage,
-            });
+            let call = calls
+                .entry(piece["index"].as_u64().unwrap_or(0))
+                .or_default();
+            if let Some(id) = piece["id"].as_str() {
+                call.id = id.to_owned();
+            }
+            if let Some(name) = piece["function"]["name"].as_str() {
+                call.name.push_str(name);
+            }
+            if let Some(arguments) = piece["function"]["arguments"].as_str() {
+                call.arguments.push_str(arguments);
+            }
         }
         if let Some(reason) = choice["finish_reason"].as_str() {
             stop = Some(match reason {
-                "stop" => StopReason::EndTurn,
+                "stop" | "tool_calls" => StopReason::EndTurn,
                 "length" => StopReason::MaxTokens,
                 "content_filter" => StopReason::Refusal(None),
                 other => StopReason::Other(other.to_owned()),
@@ -124,18 +205,24 @@ fn read_stream(
         }
     }
 
+    answer.add_usage(usage);
     // Some servers end the stream without a finish reason; treat that as a normal end.
-    Ok(Completion {
-        stop: stop.unwrap_or(StopReason::EndTurn),
-        usage,
-    })
+    let stop = stop.unwrap_or(StopReason::EndTurn);
+    if stop == StopReason::EndTurn && !calls.is_empty() {
+        return Ok(Round::ToolCalls {
+            text,
+            calls: calls.into_values().collect(),
+        });
+    }
+    Ok(Round::Done(stop))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::conversation::Turn;
-    use crate::providers::mock::{MockServer, Reply};
+    use crate::providers::Event;
+    use crate::providers::mock::{FakeSearch, MockServer, Reply};
 
     fn conversation() -> Conversation {
         Conversation {
@@ -187,9 +274,15 @@ mod tests {
         .with_session_header("x-opencode-session");
 
         let mut text = String::new();
+        let options = Options {
+            search: Search::Provider,
+            ..Options::default()
+        };
         let completion = client
-            .stream("nemotron-vl", Tier::Fast, &conversation(), &mut |piece| {
-                text.push_str(piece);
+            .stream("nemotron-vl", options, &conversation(), &mut |event| {
+                if let Event::Text(piece) = event {
+                    text.push_str(piece);
+                }
                 ControlFlow::Continue(())
             })
             .unwrap();
@@ -200,7 +293,8 @@ mod tests {
                 stop: StopReason::EndTurn,
                 usage: Usage {
                     input_tokens: 1200,
-                    output_tokens: 9
+                    output_tokens: 9,
+                    web_searches: 0,
                 }
             }
         );
@@ -211,6 +305,10 @@ mod tests {
         assert_eq!(request.header("x-opencode-session"), Some("conversation-1"));
         let body: Value = serde_json::from_str(&request.body).unwrap();
         assert_eq!(body["stream_options"]["include_usage"], true);
+        assert!(
+            body.get("tools").is_none(),
+            "no built-in search in this format"
+        );
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(
             messages[0],
@@ -247,7 +345,7 @@ mod tests {
             "sk-test".into(),
         );
         let ask = || {
-            client.stream("m", Tier::Deep, &conversation(), &mut |_| {
+            client.stream("m", Options::default(), &conversation(), &mut |_| {
                 ControlFlow::Continue(())
             })
         };
@@ -257,5 +355,75 @@ mod tests {
         );
         assert!(matches!(ask(), Err(ProviderError::Api(message)) if message == "model overloaded"));
         assert_eq!(ask().unwrap().stop, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn calls_the_search_tool_through_function_calling() {
+        let server = MockServer::start(vec![
+            sse(&[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"web_search","arguments":""}}]}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"query\":"}}]}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"stardew rabbit foot\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+                r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":12}}"#,
+                "[DONE]",
+            ]),
+            sse(&[
+                r#"{"choices":[{"delta":{"content":"Rabbits drop it."},"finish_reason":"stop"}]}"#,
+                r#"{"choices":[],"usage":{"prompt_tokens":150,"completion_tokens":5}}"#,
+                "[DONE]",
+            ]),
+        ]);
+        let client = ChatCompletions::new(
+            format!("{}/v1/chat/completions", server.url),
+            "sk-test".into(),
+        );
+        let search = FakeSearch::new("1. Rabbit's Foot");
+
+        let mut text = String::new();
+        let options = Options {
+            search: Search::Tool(&search),
+            ..Options::default()
+        };
+        let completion = client
+            .stream("glm-5.3", options, &conversation(), &mut |event| {
+                if let Event::Text(piece) = event {
+                    text.push_str(piece);
+                }
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(text, "Rabbits drop it.");
+        assert_eq!(search.queries(), ["stardew rabbit foot"]);
+        assert_eq!(
+            completion.usage,
+            Usage {
+                input_tokens: 250,
+                output_tokens: 17,
+                web_searches: 1,
+            }
+        );
+
+        let requests = server.requests();
+        let first: Value = serde_json::from_str(&requests[0].body).unwrap();
+        assert_eq!(first["tools"][0]["function"]["name"], "web_search");
+        assert!(
+            first["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("You can search the web")
+        );
+        let second: Value = serde_json::from_str(&requests[1].body).unwrap();
+        let messages = second["messages"].as_array().unwrap();
+        assert_eq!(
+            messages[4],
+            json!({ "role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": { "name": "web_search", "arguments": "{\"query\":\"stardew rabbit foot\"}" },
+            }] })
+        );
+        assert_eq!(
+            messages[5],
+            json!({ "role": "tool", "tool_call_id": "call_1", "content": "1. Rabbit's Foot" })
+        );
     }
 }

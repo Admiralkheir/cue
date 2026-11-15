@@ -90,6 +90,42 @@ impl ModelInfo {
     }
 }
 
+/// How much a model thinks before it answers. More thinking gives more thorough answers but
+/// takes longer and costs more tokens.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Effort {
+    /// Whatever the model does when not told.
+    #[default]
+    Default,
+    Low,
+    Medium,
+    High,
+}
+
+impl Effort {
+    pub const ALL: [Effort; 4] = [Effort::Default, Effort::Low, Effort::Medium, Effort::High];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Effort::Default => "Model default",
+            Effort::Low => "Low",
+            Effort::Medium => "Medium",
+            Effort::High => "High",
+        }
+    }
+
+    /// The level as providers name it; `None` leaves it to the model.
+    pub fn level(self) -> Option<&'static str> {
+        match self {
+            Effort::Default => None,
+            Effort::Low => Some("low"),
+            Effort::Medium => Some("medium"),
+            Effort::High => Some("high"),
+        }
+    }
+}
+
 /// The user's choice of model: which account to bill and which model to call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelRef {

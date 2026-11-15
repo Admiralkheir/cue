@@ -4,10 +4,10 @@ use std::ops::ControlFlow;
 
 use serde_json::{Value, json};
 
+use super::answer::{self, Answer, TOOL_DESCRIPTION, TOOL_NAME};
 use super::http::{self, error_message};
-use super::{Completion, ProviderError, StopReason, Usage, max_tokens};
+use super::{Completion, OnEvent, Options, ProviderError, Search, StopReason, Usage, max_tokens};
 use crate::conversation::{Conversation, Role};
-use crate::recommend::Tier;
 
 pub struct Responses {
     /// The full `.../responses` URL.
@@ -33,44 +33,102 @@ impl Responses {
         self
     }
 
-    pub fn stream(
+    fn request_body(
         &self,
         model: &str,
-        tier: Tier,
+        options: Options<'_>,
         conversation: &Conversation,
-        on_text: &mut dyn FnMut(&str) -> ControlFlow<()>,
-    ) -> Result<Completion, ProviderError> {
+        input: &[Value],
+    ) -> Value {
+        let reasons = reasons(model);
+        let tools = match options.search {
+            Search::Off => None,
+            Search::Provider => Some(json!([{ "type": "web_search" }])),
+            Search::Tool(_) => Some(json!([{
+                "type": "function",
+                "name": TOOL_NAME,
+                "description": TOOL_DESCRIPTION,
+                "parameters": answer::tool_parameters(),
+            }])),
+        };
         let mut body = json!({
             "model": model,
-            "instructions": conversation.system,
-            "input": input(conversation),
-            "max_output_tokens": max_tokens(tier),
+            "instructions": answer::system_prompt(&conversation.system, tools.is_some()),
+            "input": input,
+            "max_output_tokens": max_tokens(options.effort),
             "stream": true,
             // Screenshots of someone's screen have no reason to be kept server-side.
             "store": false,
         });
-        // GPT-5 and later reason by default; quick in-game questions don't need much.
-        if tier == Tier::Fast && reasons_by_default(model) {
-            body["reasoning"] = json!({ "effort": "low" });
+        if reasons && let Some(level) = options.effort.level() {
+            body["reasoning"] = json!({ "effort": level });
         }
+        if let Some(tools) = tools {
+            body["tools"] = tools;
+            // Without storage, reasoning only carries over a tool call in encrypted form.
+            if reasons && matches!(options.search, Search::Tool(_)) {
+                body["include"] = json!(["reasoning.encrypted_content"]);
+            }
+        }
+        body
+    }
 
-        let mut request = self
-            .agent
-            .post(&self.endpoint)
-            .header("authorization", &format!("Bearer {}", self.api_key));
-        if let Some(name) = self.session_header {
-            request = request.header(name, &conversation.id);
+    pub fn stream(
+        &self,
+        model: &str,
+        options: Options<'_>,
+        conversation: &Conversation,
+        on_event: &mut OnEvent<'_>,
+    ) -> Result<Completion, ProviderError> {
+        let mut answer = Answer::new(options.search, on_event);
+        let mut input = input(conversation);
+        loop {
+            answer.next_round()?;
+            let body = self.request_body(model, options, conversation, &input);
+            let mut request = self
+                .agent
+                .post(&self.endpoint)
+                .header("authorization", &format!("Bearer {}", self.api_key));
+            if let Some(name) = self.session_header {
+                request = request.header(name, &conversation.id);
+            }
+            let mut response = http::send_json(request, &body)?;
+            let output = match read_stream(&mut response, &mut answer)? {
+                Round::Done(stop) => return Ok(answer.finish(stop)),
+                Round::ToolCalls(output) => output,
+            };
+            let mut results = Vec::new();
+            for call in output.iter().filter(|item| item["type"] == "function_call") {
+                let arguments =
+                    answer::parse_arguments(call["arguments"].as_str().unwrap_or_default());
+                let Some(result) = answer.call_tool(&arguments) else {
+                    return Ok(answer.finish(StopReason::Other("function_call".into())));
+                };
+                let ControlFlow::Continue(result) = result else {
+                    return Ok(answer.finish(StopReason::Cancelled));
+                };
+                results.push(json!({
+                    "type": "function_call_output",
+                    "call_id": call["call_id"],
+                    "output": result,
+                }));
+            }
+            // The model's own output, reasoning included, goes back ahead of the results.
+            input.extend(output);
+            input.extend(results);
         }
-        let mut body = http::send_json(request, &body)?;
-        read_stream(&mut body, on_text)
     }
 }
 
-fn reasons_by_default(model: &str) -> bool {
-    ["gpt-5", "gpt-6"]
+/// Models that reason and take `reasoning.effort`: GPT-5 and later, and the o-series.
+fn reasons(model: &str) -> bool {
+    let gpt = ["gpt-5", "gpt-6"]
         .iter()
         .any(|family| model.starts_with(family))
-        && !model.contains("chat")
+        && !model.contains("chat");
+    gpt || ["o1", "o3", "o4"]
+        .iter()
+        .any(|family| model.starts_with(family))
 }
 
 fn input(conversation: &Conversation) -> Vec<Value> {
@@ -94,48 +152,57 @@ fn input(conversation: &Conversation) -> Vec<Value> {
         .collect()
 }
 
+enum Round {
+    Done(StopReason),
+    /// The model called Cue's search tool; this is all of its output.
+    ToolCalls(Vec<Value>),
+}
+
 fn read_stream(
     body: &mut ureq::Body,
-    on_text: &mut dyn FnMut(&str) -> ControlFlow<()>,
-) -> Result<Completion, ProviderError> {
-    let mut usage = Usage::default();
+    answer: &mut Answer<'_, '_, '_>,
+) -> Result<Round, ProviderError> {
     let mut refusal = String::new();
 
     for event in http::json_events(body) {
         let Some(event) = event? else { break };
         let response = &event["response"];
-        if let Some(input) = response["usage"]["input_tokens"].as_u64() {
-            usage.input_tokens = input;
-            usage.output_tokens = response["usage"]["output_tokens"].as_u64().unwrap_or(0);
-        }
         match event["type"].as_str() {
             Some("response.output_text.delta") => {
                 let text = event["delta"].as_str().unwrap_or_default();
-                if on_text(text).is_break() {
-                    return Ok(Completion {
-                        stop: StopReason::Cancelled,
-                        usage,
-                    });
+                if answer.text(text).is_break() {
+                    return Ok(Round::Done(StopReason::Cancelled));
+                }
+            }
+            Some("response.output_item.added") if event["item"]["type"] == "web_search_call" => {
+                if answer.provider_search(None).is_break() {
+                    return Ok(Round::Done(StopReason::Cancelled));
                 }
             }
             Some("response.refusal.delta") => {
                 refusal.push_str(event["delta"].as_str().unwrap_or_default())
             }
             Some("response.completed") => {
-                let stop = if refusal.is_empty() {
+                answer.add_usage(usage(response));
+                let output = response["output"].as_array().cloned().unwrap_or_default();
+                if output.iter().any(|item| item["type"] == "function_call") {
+                    return Ok(Round::ToolCalls(output));
+                }
+                return Ok(Round::Done(if refusal.is_empty() {
                     StopReason::EndTurn
                 } else {
                     StopReason::Refusal(Some(refusal))
-                };
-                return Ok(Completion { stop, usage });
+                }));
             }
             Some("response.incomplete") => {
-                let stop = match response["incomplete_details"]["reason"].as_str() {
-                    Some("max_output_tokens") => StopReason::MaxTokens,
-                    Some("content_filter") => StopReason::Refusal(None),
-                    reason => StopReason::Other(reason.unwrap_or("incomplete").to_owned()),
-                };
-                return Ok(Completion { stop, usage });
+                answer.add_usage(usage(response));
+                return Ok(Round::Done(
+                    match response["incomplete_details"]["reason"].as_str() {
+                        Some("max_output_tokens") => StopReason::MaxTokens,
+                        Some("content_filter") => StopReason::Refusal(None),
+                        reason => StopReason::Other(reason.unwrap_or("incomplete").to_owned()),
+                    },
+                ));
             }
             Some("response.failed") => {
                 let message =
@@ -156,12 +223,33 @@ fn read_stream(
     ))
 }
 
+/// Usage from a final response, counting the provider's own searches.
+fn usage(response: &Value) -> Usage {
+    let searches = response["output"].as_array().map_or(0, |output| {
+        output
+            .iter()
+            // Opening or reading a page isn't a search.
+            .filter(|item| {
+                item["type"] == "web_search_call"
+                    && matches!(item["action"]["type"].as_str(), None | Some("search"))
+            })
+            .count()
+    });
+    Usage {
+        input_tokens: response["usage"]["input_tokens"].as_u64().unwrap_or(0),
+        output_tokens: response["usage"]["output_tokens"].as_u64().unwrap_or(0),
+        web_searches: searches as u32,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::capture::EncodedFrame;
     use crate::conversation::Turn;
-    use crate::providers::mock::{MockServer, Reply};
+    use crate::provider::Effort;
+    use crate::providers::Event;
+    use crate::providers::mock::{FakeSearch, MockServer, Reply, sse};
 
     fn conversation() -> Conversation {
         Conversation {
@@ -189,25 +277,32 @@ mod tests {
         }
     }
 
-    fn sse(events: &[&str]) -> Reply {
-        let body: String = events
-            .iter()
-            .map(|data| format!("event: x\ndata: {data}\n\n"))
-            .collect();
-        Reply::new(200, "text/event-stream", body)
+    fn effort(effort: Effort) -> Options<'static> {
+        Options {
+            effort,
+            ..Options::default()
+        }
     }
 
     fn ask(
         client: &Responses,
         model: &str,
-        tier: Tier,
-    ) -> (Result<Completion, ProviderError>, String) {
+        options: Options<'_>,
+    ) -> (Result<Completion, ProviderError>, String, usize) {
         let mut text = String::new();
-        let result = client.stream(model, tier, &conversation(), &mut |piece| {
-            text.push_str(piece);
+        let mut searches = 0;
+        let result = client.stream(model, options, &conversation(), &mut |event| {
+            match event {
+                Event::Text(piece) => text.push_str(piece),
+                Event::Searching(_) => searches += 1,
+            }
             ControlFlow::Continue(())
         });
-        (result, text)
+        (result, text, searches)
+    }
+
+    fn body(request: &crate::providers::mock::Request) -> Value {
+        serde_json::from_str(&request.body).unwrap()
     }
 
     #[test]
@@ -221,7 +316,7 @@ mod tests {
         let client = Responses::new(format!("{}/v1/responses", server.url), "sk-test".into())
             .with_session_header("x-opencode-session");
 
-        let (result, text) = ask(&client, "gpt-6-luna", Tier::Fast);
+        let (result, text, _) = ask(&client, "gpt-6-luna", effort(Effort::Low));
         assert_eq!(text, "Stay mobile.");
         assert_eq!(
             result.unwrap(),
@@ -229,7 +324,8 @@ mod tests {
                 stop: StopReason::EndTurn,
                 usage: Usage {
                     input_tokens: 2100,
-                    output_tokens: 30
+                    output_tokens: 30,
+                    web_searches: 0,
                 }
             }
         );
@@ -237,10 +333,11 @@ mod tests {
         let request = &server.requests()[0];
         assert_eq!(request.header("authorization"), Some("Bearer sk-test"));
         assert_eq!(request.header("x-opencode-session"), Some("conversation-1"));
-        let body: Value = serde_json::from_str(&request.body).unwrap();
+        let body = body(request);
         assert_eq!(body["instructions"], "be brief");
         assert_eq!(body["store"], false);
         assert_eq!(body["reasoning"]["effort"], "low");
+        assert!(body.get("tools").is_none());
         let input = body["input"].as_array().unwrap();
         assert_eq!(
             input[0]["content"][0],
@@ -264,15 +361,101 @@ mod tests {
     #[test]
     fn leaves_reasoning_alone_where_it_does_not_apply() {
         let completed = r#"{"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}"#;
-        let server = MockServer::start(vec![sse(&[completed]), sse(&[completed])]);
+        let server = MockServer::start(vec![
+            sse(&[completed]),
+            sse(&[completed]),
+            sse(&[completed]),
+        ]);
         let client = Responses::new(format!("{}/v1/responses", server.url), "sk-test".into());
 
-        ask(&client, "gpt-6-luna", Tier::Deep).0.unwrap();
-        ask(&client, "grok-4.7", Tier::Fast).0.unwrap();
-        for request in server.requests() {
-            let body: Value = serde_json::from_str(&request.body).unwrap();
-            assert!(body.get("reasoning").is_none());
-        }
+        ask(&client, "gpt-6-luna", effort(Effort::Default))
+            .0
+            .unwrap();
+        ask(&client, "grok-4.7", effort(Effort::High)).0.unwrap();
+        ask(&client, "o4-mini", effort(Effort::Medium)).0.unwrap();
+        let requests = server.requests();
+        assert!(body(&requests[0]).get("reasoning").is_none());
+        assert!(body(&requests[1]).get("reasoning").is_none());
+        assert_eq!(body(&requests[2])["reasoning"]["effort"], "medium");
+    }
+
+    #[test]
+    fn counts_the_providers_own_searches() {
+        let server = MockServer::start(vec![sse(&[
+            r#"{"type":"response.output_item.added","item":{"type":"web_search_call","id":"ws_1"}}"#,
+            r#"{"type":"response.output_item.added","item":{"type":"web_search_call","id":"ws_2"}}"#,
+            r#"{"type":"response.output_text.delta","delta":"Patch 1.2 nerfed it."}"#,
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":9,"output_tokens":4},"output":[
+                {"type":"web_search_call","action":{"type":"search","query":"x"}},
+                {"type":"web_search_call","action":{"type":"open_page","url":"https://a"}},
+                {"type":"message","content":[]}]}}"#,
+        ])]);
+        let client = Responses::new(format!("{}/v1/responses", server.url), "sk-test".into());
+
+        let options = Options {
+            search: Search::Provider,
+            ..Options::default()
+        };
+        let (result, text, searches) = ask(&client, "gpt-6-luna", options);
+        assert_eq!(text, "Patch 1.2 nerfed it.");
+        assert_eq!(searches, 2);
+        assert_eq!(
+            result.unwrap().usage.web_searches,
+            1,
+            "opening a page isn't a search"
+        );
+        let body = body(&server.requests()[0]);
+        assert_eq!(body["tools"], json!([{ "type": "web_search" }]));
+        assert!(body.get("include").is_none());
+    }
+
+    #[test]
+    fn calls_the_search_tool_and_sends_the_output_back() {
+        let server = MockServer::start(vec![
+            sse(&[
+                r#"{"type":"response.completed","response":{"usage":{"input_tokens":100,"output_tokens":10},"output":[
+                    {"type":"reasoning","id":"rs_1","encrypted_content":"enc"},
+                    {"type":"function_call","id":"fc_1","call_id":"call_1","name":"web_search","arguments":"{\"query\":\"silksong needle upgrade\"}"}]}}"#,
+            ]),
+            sse(&[
+                r#"{"type":"response.output_text.delta","delta":"Visit the forge."}"#,
+                r#"{"type":"response.completed","response":{"usage":{"input_tokens":200,"output_tokens":20},"output":[]}}"#,
+            ]),
+        ]);
+        let client = Responses::new(format!("{}/v1/responses", server.url), "sk-test".into());
+        let search = FakeSearch::new("1. Pinmaster's forge");
+
+        let options = Options {
+            effort: Effort::Medium,
+            search: Search::Tool(&search),
+        };
+        let (result, text, searches) = ask(&client, "gpt-6-luna", options);
+        assert_eq!(text, "Visit the forge.");
+        assert_eq!(searches, 1);
+        assert_eq!(search.queries(), ["silksong needle upgrade"]);
+        assert_eq!(
+            result.unwrap().usage,
+            Usage {
+                input_tokens: 300,
+                output_tokens: 30,
+                web_searches: 1,
+            }
+        );
+
+        let requests = server.requests();
+        let first = body(&requests[0]);
+        assert_eq!(first["tools"][0]["type"], "function");
+        assert_eq!(first["tools"][0]["name"], "web_search");
+        assert_eq!(first["include"], json!(["reasoning.encrypted_content"]));
+        let input = body(&requests[1])["input"].as_array().unwrap().clone();
+        assert_eq!(input.len(), 6);
+        assert_eq!(input[3]["type"], "reasoning");
+        assert_eq!(input[3]["encrypted_content"], "enc");
+        assert_eq!(input[4]["call_id"], "call_1");
+        assert_eq!(
+            input[5],
+            json!({ "type": "function_call_output", "call_id": "call_1", "output": "1. Pinmaster's forge" })
+        );
     }
 
     #[test]
@@ -293,7 +476,7 @@ mod tests {
             Reply::json(401, r#"{"error":{"message":"Incorrect API key provided"}}"#),
         ]);
         let client = Responses::new(format!("{}/v1/responses", server.url), "sk-test".into());
-        let ask = || ask(&client, "gpt-6-luna", Tier::Deep).0;
+        let ask = || ask(&client, "gpt-6-luna", Options::default()).0;
 
         assert_eq!(ask().unwrap().stop, StopReason::MaxTokens);
         assert_eq!(

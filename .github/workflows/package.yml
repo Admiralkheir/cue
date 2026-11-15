@@ -4,6 +4,11 @@ name: Package
 # the release workflow; can also be started by hand.
 on:
   workflow_call:
+    secrets:
+      MACOS_SIGN_P12:
+        required: false
+      MACOS_SIGN_PASSWORD:
+        required: false
   workflow_dispatch:
 
 permissions:
@@ -26,6 +31,11 @@ jobs:
         with:
           tool: cargo-about
       - run: cargo about generate about.hbs --output-file THIRD_PARTY_LICENSES.html
+      - name: Import the signing certificate
+        env:
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+        run: scripts/ci-import-macos-cert.sh
       - run: scripts/package-macos.sh dist
       - uses: actions/upload-artifact@v7
         with:
