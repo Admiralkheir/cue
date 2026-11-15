@@ -6,8 +6,9 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::games::{GameProfile, find_profile};
-use crate::provider::{ModelRef, ProviderAccount};
+use crate::provider::{Effort, ModelRef, ProviderAccount};
 use crate::recommend::Tier;
+use crate::search::DEFAULT_SEARXNG_URL;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -114,6 +115,51 @@ impl Default for UpdateSettings {
     }
 }
 
+/// Where the model's web searches go.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchMode {
+    /// The model answers from what it knows.
+    #[default]
+    Off,
+    /// The provider's own search, which it bills per search.
+    Provider,
+    /// A SearXNG instance the user runs, free.
+    Searxng,
+}
+
+/// How the models answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnswerSettings {
+    pub fast_effort: Effort,
+    pub deep_effort: Effort,
+    pub web_search: WebSearchMode,
+    /// Used when `web_search` is `searxng`.
+    pub searxng_url: String,
+}
+
+impl AnswerSettings {
+    pub fn effort(&self, tier: Tier) -> Effort {
+        match tier {
+            Tier::Fast => self.fast_effort,
+            Tier::Deep => self.deep_effort,
+        }
+    }
+}
+
+impl Default for AnswerSettings {
+    fn default() -> Self {
+        Self {
+            // Quick in-game questions don't need much thinking, and less thinking is faster.
+            fast_effort: Effort::Low,
+            deep_effort: Effort::Default,
+            web_search: WebSearchMode::Off,
+            searxng_url: DEFAULT_SEARXNG_URL.into(),
+        }
+    }
+}
+
 /// Everything Cue persists, except API keys, which live in the OS keychain.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -122,6 +168,7 @@ pub struct Config {
     pub fast_model: Option<ModelRef>,
     pub deep_model: Option<ModelRef>,
     pub hotkeys: Hotkeys,
+    pub answers: AnswerSettings,
     pub overlay: OverlaySettings,
     pub games: Vec<GameProfile>,
     pub updates: UpdateSettings,
@@ -278,6 +325,12 @@ mod tests {
                 model: "claude-sonnet-5-5".into(),
             }),
             hotkeys: Hotkeys::default(),
+            answers: AnswerSettings {
+                fast_effort: Effort::Medium,
+                deep_effort: Effort::High,
+                web_search: WebSearchMode::Searxng,
+                searxng_url: "http://127.0.0.1:8888".into(),
+            },
             overlay: OverlaySettings {
                 theme: "ocean".into(),
                 opacity: 0.65,
@@ -340,6 +393,15 @@ mod tests {
         assert_eq!(config.deep_model, pick("kept"));
         assert_eq!(config.games[0].fast_model, None);
         assert_eq!(config.games[0].deep_model, pick("kept"));
+    }
+
+    #[test]
+    fn older_configs_keep_low_effort_for_fast_answers() {
+        let config: Config = toml::from_str("[hotkeys]\nask = \"F9\"\n").unwrap();
+        assert_eq!(config.answers, AnswerSettings::default());
+        assert_eq!(config.answers.effort(Tier::Fast), Effort::Low);
+        assert_eq!(config.answers.effort(Tier::Deep), Effort::Default);
+        assert_eq!(config.answers.web_search, WebSearchMode::Off);
     }
 
     #[test]

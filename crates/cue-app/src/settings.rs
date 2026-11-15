@@ -4,10 +4,11 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cue_core::providers;
+use cue_core::search::SearxNg;
 use cue_core::update::{self, Release};
 use cue_core::{
-    Config, Hotkeys, ModelInfo, OverlaySettings, ProviderAccount, ProviderKind, Tier, recommend,
-    secrets,
+    Config, Effort, Hotkeys, ModelInfo, OverlaySettings, ProviderAccount, ProviderKind, Tier,
+    WebSearchMode, recommend, secrets,
 };
 use gpui_kit::component::Disableable;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -45,6 +46,13 @@ enum Message {
     Error(String),
 }
 
+/// Where the check of the SearXNG address stands.
+enum SearxngCheck {
+    Running,
+    Passed(usize),
+    Failed(String),
+}
+
 pub struct Settings {
     overlay: OverlayHandle,
     new_kind: ProviderKind,
@@ -56,6 +64,8 @@ pub struct Settings {
     ask_input: Entity<InputState>,
     ask_deep_input: Entity<InputState>,
     show_input: Entity<InputState>,
+    searxng_input: Entity<InputState>,
+    searxng_check: Option<SearxngCheck>,
     /// Bumped on every slider move, so a drag saves the config once, at the end.
     pending_saves: u64,
     message: Option<Message>,
@@ -88,6 +98,11 @@ impl Settings {
                 .placeholder("Off")
                 .default_value(config.hotkeys.show.clone())
         });
+        let searxng_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(cue_core::search::DEFAULT_SEARXNG_URL)
+                .default_value(config.answers.searxng_url.clone())
+        });
         let subscriptions = vec![
             cx.subscribe_in(&fast_select, window, |this, _, event, _, cx| {
                 this.on_model_picked(Tier::Fast, event, cx)
@@ -117,6 +132,8 @@ impl Settings {
             ask_input,
             ask_deep_input,
             show_input,
+            searxng_input,
+            searxng_check: None,
             pending_saves: 0,
             message: cx
                 .global::<AppState>()
@@ -411,6 +428,158 @@ impl Settings {
         self.show_input
             .update(cx, |input, cx| input.set_value(defaults.show, window, cx));
         self.apply_hotkeys(cx);
+    }
+
+    fn set_effort(&mut self, tier: Tier, effort: Effort, cx: &mut Context<Self>) {
+        let answers = &mut cx.global_mut::<AppState>().config.answers;
+        match tier {
+            Tier::Fast => answers.fast_effort = effort,
+            Tier::Deep => answers.deep_effort = effort,
+        }
+        self.save_now(cx);
+    }
+
+    fn set_web_search(&mut self, mode: WebSearchMode, cx: &mut Context<Self>) {
+        cx.global_mut::<AppState>().config.answers.web_search = mode;
+        self.save_now(cx);
+    }
+
+    /// Saves the SearXNG address and runs a search against it.
+    fn check_searxng(&mut self, cx: &mut Context<Self>) {
+        let url = self.searxng_input.read(cx).value().trim().to_owned();
+        cx.global_mut::<AppState>().config.answers.searxng_url = url.clone();
+        self.save_now(cx);
+        self.searxng_check = Some(SearxngCheck::Running);
+        cx.notify();
+
+        let search = cx.background_spawn(async move {
+            SearxNg::new(&url)
+                .results("cue test search")
+                .map_err(|err| err.to_string())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = search.await;
+            this.update(cx, |this, cx| {
+                this.searxng_check = Some(match result {
+                    Ok(results) => SearxngCheck::Passed(results.len()),
+                    Err(err) => {
+                        tracing::warn!("SearXNG check failed: {err}");
+                        SearxngCheck::Failed(err)
+                    }
+                });
+                cx.notify();
+            })
+        })
+        .detach();
+    }
+
+    fn render_answers(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let answers = cx.global::<AppState>().config.answers.clone();
+        let effort_row = |tier: Tier, current: Effort, cx: &mut Context<Self>| {
+            let buttons = Effort::ALL.into_iter().map(|effort| {
+                let id = SharedString::from(format!("effort-{tier:?}-{effort:?}"));
+                let button = Button::new(id).label(effort.label());
+                let button = if effort == current {
+                    button.primary()
+                } else {
+                    button.outline()
+                };
+                button
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_effort(tier, effort, cx)))
+            });
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .children(buttons.collect::<Vec<_>>())
+        };
+        let modes = [
+            (WebSearchMode::Off, "Off"),
+            (WebSearchMode::Provider, "Provider's search (paid)"),
+            (WebSearchMode::Searxng, "SearXNG (free, self-hosted)"),
+        ]
+        .into_iter()
+        .map(|(mode, label)| {
+            let button = Button::new(SharedString::from(format!("search-{mode:?}"))).label(label);
+            let button = if mode == answers.web_search {
+                button.primary()
+            } else {
+                button.outline()
+            };
+            button.on_click(cx.listener(move |this, _, _, cx| this.set_web_search(mode, cx)))
+        })
+        .collect::<Vec<_>>();
+
+        let search_details = match answers.web_search {
+            WebSearchMode::Off => div().text_xs().text_color(rgb(MUTED)).child(
+                "Models answer from what they already know, which can be out of date for new \
+                 games and patches.",
+            ),
+            WebSearchMode::Provider => div().text_xs().text_color(rgb(WARNING)).child(
+                "Claude, GPT and Gemini models search with their provider's own tool. The \
+                 provider bills every search on top of tokens; check its pricing. Claude models \
+                 through OpenCode can't use it (OpenCode doesn't pass the tool on), and other \
+                 models answer without searching; use SearXNG for those. Cue allows up to 4 \
+                 searches per answer and shows how many were made under it.",
+            ),
+            WebSearchMode::Searxng => {
+                let check = self.searxng_check.as_ref().map(|check| match check {
+                    SearxngCheck::Running => {
+                        div().text_xs().text_color(rgb(MUTED)).child("Searching…")
+                    }
+                    SearxngCheck::Passed(count) => div()
+                        .text_xs()
+                        .text_color(rgb(ACCENT))
+                        .child(format!("SearXNG works: {count} results for a test search.")),
+                    SearxngCheck::Failed(err) => {
+                        div().text_xs().text_color(rgb(ERROR)).child(err.clone())
+                    }
+                });
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(
+                        "Cue searches your own SearXNG instance whenever the model asks for it, \
+                         up to 4 times per answer. Searches are free and stay between you and the \
+                         search engines SearXNG uses. The model has to support tool calls. \
+                         SearXNG must serve JSON: add json under search: formats: in its \
+                         settings.yml.",
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(div().flex_1().child(Input::new(&self.searxng_input)))
+                            .child(
+                                Button::new("check-searxng")
+                                    .outline()
+                                    .label("Save and test")
+                                    .disabled(matches!(
+                                        self.searxng_check,
+                                        Some(SearxngCheck::Running)
+                                    ))
+                                    .on_click(cx.listener(|this, _, _, cx| this.check_searxng(cx))),
+                            ),
+                    )
+                    .children(check)
+            }
+        };
+
+        section("Answers")
+            .child(div().text_sm().child("Thinking effort for fast answers"))
+            .child(effort_row(Tier::Fast, answers.fast_effort, cx))
+            .child(div().text_sm().child("Thinking effort for deep answers"))
+            .child(effort_row(Tier::Deep, answers.deep_effort, cx))
+            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                "More effort gives more thorough answers and more concrete suggestions, but \
+                 takes longer and uses more tokens. It applies to Claude, GPT and Gemini models; \
+                 others always use their own default. A game profile's own models use these \
+                 settings too.",
+            ))
+            .child(div().text_sm().child("Web search"))
+            .child(div().flex().flex_wrap().gap_2().children(modes))
+            .child(search_details)
     }
 
     fn render_appearance(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -932,6 +1101,7 @@ impl Render for Settings {
                     .child(div().text_sm().child(format!("Deep — strategy ({ask_deep})")))
                     .child(Select::new(&self.deep_select).placeholder("Pick a model (add a key first if the list is empty)")),
             )
+            .child(self.render_answers(cx))
             .child(self.render_games(cx))
             .child(self.render_appearance(cx))
             .child(self.render_hotkeys(cx))

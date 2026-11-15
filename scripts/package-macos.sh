@@ -29,9 +29,29 @@ if [[ -f THIRD_PARTY_LICENSES.html ]]; then
     cp THIRD_PARTY_LICENSES.html "$app/Contents/Resources/"
 fi
 
-# Not Developer ID signed or notarized yet. An ad-hoc signature is still required for
-# the bundle to launch on Apple silicon.
-codesign --force --deep --sign - "$app"
+# macOS ties Screen Recording to the app's designated requirement. An ad-hoc signature's
+# requirement is its cdhash, which every build changes: after a rebuild or an update,
+# System Settings still shows Cue as allowed but the grant no longer applies, and macOS
+# doesn't ask again. Signing with a certificate makes the requirement "this bundle id,
+# signed by this certificate", which stays the same from build to build. See
+# packaging/macos/SIGNING.md.
+#
+# CUE_MACOS_SIGN_IDENTITY picks the identity (its name or SHA-1). Without it, a
+# "Cue Local Signing" certificate made by scripts/macos-signing-cert.sh is used when the
+# keychain has one, and otherwise the bundle is signed ad hoc, which Apple silicon still
+# needs to launch it.
+identity="${CUE_MACOS_SIGN_IDENTITY:-}"
+if [[ -z "$identity" ]] && security find-identity -p codesigning | grep -q '"Cue Local Signing"'; then
+    identity="Cue Local Signing"
+fi
+if [[ -z "$identity" ]]; then
+    echo "warning: signing ad hoc; Screen Recording has to be allowed again after every" \
+        "build (see packaging/macos/SIGNING.md)" >&2
+    identity="-"
+fi
+codesign --force --sign "$identity" "$app"
+codesign --verify --strict "$app"
+codesign --display --requirements - "$app" 2>&1 | grep '^designated'
 
 suffix="universal"
 if [[ ${#targets[@]} -eq 1 ]]; then

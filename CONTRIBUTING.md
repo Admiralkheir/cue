@@ -21,7 +21,9 @@ cargo run -p cue-app
 
 - **macOS:** the Xcode Command Line Tools are enough; Metal shaders are compiled at
   startup. Grant the terminal (or the built app) Screen Recording permission in System
-  Settings so Cue can capture windows. `scripts/package-macos.sh` builds `Cue.app`.
+  Settings so Cue can capture windows. `scripts/package-macos.sh` builds `Cue.app`; run
+  `scripts/macos-signing-cert.sh` once first, or each rebuilt `Cue.app` loses its Screen
+  Recording permission (see `packaging/macos/SIGNING.md`).
 - **Windows:** use the MSVC toolchain. Cue captures with Windows Graphics Capture.
 - **Linux (experimental):** run `scripts/install-linux-deps.sh` on Debian/Ubuntu first.
 
@@ -57,6 +59,9 @@ the detail. Never log API keys, screenshots, questions, answers or window titles
   seconds after launch.
 - `cargo run -p cue-core --example capture -- out.jpg 3` captures the frontmost window
   after three seconds, the same way the hotkey does, and saves the JPEG.
+- `cargo run -p cue-core --example ask -- --model claude-haiku-5-5 --effort medium --search searxng "question"`
+  asks a real model with a key from your config, the way the overlay does, and prints the
+  answer, each web search and the usage. Every run is billed to that key.
 
 ## Layout
 

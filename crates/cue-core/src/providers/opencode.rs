@@ -4,13 +4,13 @@
 //! The Anthropic Messages, OpenAI Responses, Gemini and Chat Completions formats are all
 //! wired up; only Jev, which isn't a chat model, is left out.
 
-use std::ops::ControlFlow;
-
 use super::http;
-use super::{Anthropic, ChatCompletions, Completion, Gemini, Provider, ProviderError, Responses};
+use super::{
+    Anthropic, ChatCompletions, Completion, Gemini, OnEvent, Options, Provider, ProviderError,
+    Responses, Search,
+};
 use crate::conversation::Conversation;
 use crate::provider::ModelInfo;
-use crate::recommend::Tier;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Plan {
@@ -143,15 +143,29 @@ impl Provider for OpenCode {
     fn stream(
         &self,
         model: &str,
-        tier: Tier,
+        options: Options<'_>,
         conversation: &Conversation,
-        on_text: &mut dyn FnMut(&str) -> ControlFlow<()>,
+        on_event: &mut OnEvent<'_>,
     ) -> Result<Completion, ProviderError> {
         match self.plan.format(model) {
-            Format::Anthropic => self.anthropic.stream(model, tier, conversation, on_text),
-            Format::Responses => self.responses.stream(model, tier, conversation, on_text),
-            Format::Gemini => self.gemini.stream(model, tier, conversation, on_text),
-            Format::ChatCompletions => self.chat.stream(model, tier, conversation, on_text),
+            Format::Anthropic => {
+                // OpenCode doesn't pass Anthropic's own web search tool on: Claude models
+                // answer that they can't search. Ask without it rather than promise a search.
+                let options = match options.search {
+                    Search::Provider => Options {
+                        search: Search::Off,
+                        ..options
+                    },
+                    _ => options,
+                };
+                self.anthropic
+                    .stream(model, options, conversation, on_event)
+            }
+            Format::Responses => self
+                .responses
+                .stream(model, options, conversation, on_event),
+            Format::Gemini => self.gemini.stream(model, options, conversation, on_event),
+            Format::ChatCompletions => self.chat.stream(model, options, conversation, on_event),
             Format::Unsupported => Err(ProviderError::Unsupported("this OpenCode model")),
         }
     }
@@ -159,6 +173,8 @@ impl Provider for OpenCode {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::ControlFlow;
+
     use serde_json::Value;
 
     use super::*;
@@ -229,10 +245,16 @@ mod tests {
         let completion = client
             .stream(
                 "claude-haiku-5-5",
-                Tier::Fast,
+                Options {
+                    effort: crate::provider::Effort::Low,
+                    // OpenCode drops this tool, so Cue doesn't send it.
+                    search: Search::Provider,
+                },
                 &conversation,
-                &mut |piece| {
-                    text.push_str(piece);
+                &mut |event| {
+                    if let crate::providers::Event::Text(piece) = event {
+                        text.push_str(piece);
+                    }
                     ControlFlow::Continue(())
                 },
             )
@@ -255,6 +277,8 @@ mod tests {
         );
         let body: Value = serde_json::from_str(&requests[1].body).unwrap();
         assert_eq!(body["output_config"]["effort"], "low");
+        assert!(body.get("tools").is_none());
+        assert_eq!(body["system"], "", "no promise of a search it can't make");
     }
 
     #[test]
@@ -279,10 +303,15 @@ mod tests {
         client
             .stream(
                 "nemotron-3.5-super-vl-free",
-                Tier::Fast,
+                Options {
+                    effort: crate::provider::Effort::Low,
+                    ..Options::default()
+                },
                 &conversation,
-                &mut |piece| {
-                    text.push_str(piece);
+                &mut |event| {
+                    if let crate::providers::Event::Text(piece) = event {
+                        text.push_str(piece);
+                    }
                     ControlFlow::Continue(())
                 },
             )
@@ -321,7 +350,7 @@ mod tests {
 
         for model in ["gpt-6-luna", "gemini-4-argon"] {
             client
-                .stream(model, Tier::Deep, &conversation, &mut |_| {
+                .stream(model, Options::default(), &conversation, &mut |_| {
                     ControlFlow::Continue(())
                 })
                 .unwrap();
@@ -349,7 +378,7 @@ mod tests {
             image: None,
             turns: Vec::new(),
         };
-        let result = client.stream("jev-1.13", Tier::Deep, &conversation, &mut |_| {
+        let result = client.stream("jev-1.13", Options::default(), &conversation, &mut |_| {
             ControlFlow::Continue(())
         });
         assert!(matches!(result, Err(ProviderError::Unsupported(_))));

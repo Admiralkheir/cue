@@ -4,11 +4,12 @@ use std::ops::ControlFlow;
 
 use serde_json::{Value, json};
 
+use super::answer::{self, Answer, TOOL_DESCRIPTION, TOOL_NAME};
 use super::http::{self, error_message};
-use super::{Completion, ProviderError, StopReason, Usage, max_tokens};
+use super::{Completion, OnEvent, Options, ProviderError, Search, StopReason, Usage, max_tokens};
 use crate::capture::EncodedFrame;
 use crate::conversation::{Conversation, Role};
-use crate::recommend::Tier;
+use crate::provider::Effort;
 
 pub struct Gemini {
     /// The `.../v1beta/models` URL that model names are appended to.
@@ -34,31 +35,98 @@ impl Gemini {
         self
     }
 
+    fn request_body(
+        model: &str,
+        options: Options<'_>,
+        conversation: &Conversation,
+        contents: &[Value],
+    ) -> Value {
+        let tools = match options.search {
+            Search::Off => None,
+            Search::Provider => Some(json!([{ "google_search": {} }])),
+            Search::Tool(_) => Some(json!([{ "functionDeclarations": [{
+                "name": TOOL_NAME,
+                "description": TOOL_DESCRIPTION,
+                "parameters": answer::tool_parameters(),
+            }] }])),
+        };
+        let system = answer::system_prompt(&conversation.system, tools.is_some());
+        let mut body = json!({
+            "systemInstruction": { "parts": [{ "text": system }] },
+            "contents": contents,
+            "generationConfig": { "maxOutputTokens": max_tokens(options.effort) },
+        });
+        if let Some(thinking) = thinking_config(model, options.effort) {
+            body["generationConfig"]["thinkingConfig"] = thinking;
+        }
+        if let Some(tools) = tools {
+            body["tools"] = tools;
+        }
+        body
+    }
+
     pub fn stream(
         &self,
         model: &str,
-        tier: Tier,
+        options: Options<'_>,
         conversation: &Conversation,
-        on_text: &mut dyn FnMut(&str) -> ControlFlow<()>,
+        on_event: &mut OnEvent<'_>,
     ) -> Result<Completion, ProviderError> {
-        let body = json!({
-            "systemInstruction": { "parts": [{ "text": conversation.system }] },
-            "contents": contents(conversation),
-            "generationConfig": { "maxOutputTokens": max_tokens(tier) },
-        });
-        let mut request = self
-            .agent
-            .post(format!(
-                "{}/{model}:streamGenerateContent?alt=sse",
-                self.models_url
-            ))
-            .header("x-goog-api-key", &self.api_key);
-        if let Some(name) = self.session_header {
-            request = request.header(name, &conversation.id);
+        let mut answer = Answer::new(options.search, on_event);
+        let mut contents = contents(conversation);
+        loop {
+            answer.next_round()?;
+            let body = Self::request_body(model, options, conversation, &contents);
+            let mut request = self
+                .agent
+                .post(format!(
+                    "{}/{model}:streamGenerateContent?alt=sse",
+                    self.models_url
+                ))
+                .header("x-goog-api-key", &self.api_key);
+            if let Some(name) = self.session_header {
+                request = request.header(name, &conversation.id);
+            }
+            let mut response = http::send_json(request, &body)?;
+            let parts = match read_stream(&mut response, &mut answer)? {
+                Round::Done(stop) => return Ok(answer.finish(stop)),
+                Round::ToolCalls(parts) => parts,
+            };
+            let mut results = Vec::new();
+            for call in parts.iter().filter_map(|part| part.get("functionCall")) {
+                let Some(result) = answer.call_tool(&call["args"]) else {
+                    return Ok(answer.finish(StopReason::Other("function_call".into())));
+                };
+                let ControlFlow::Continue(result) = result else {
+                    return Ok(answer.finish(StopReason::Cancelled));
+                };
+                let mut response = json!({ "name": TOOL_NAME, "response": { "result": result } });
+                if let Some(id) = call.get("id") {
+                    response["id"] = id.clone();
+                }
+                results.push(json!({ "functionResponse": response }));
+            }
+            // The model's parts go back unchanged: they carry its thought signatures.
+            contents.push(json!({ "role": "model", "parts": parts }));
+            contents.push(json!({ "role": "user", "parts": results }));
         }
-        let mut body = http::send_json(request, &body)?;
-        read_stream(&mut body, on_text)
     }
+}
+
+/// Gemini 2.x models take a thinking budget in tokens; later ones take a level.
+fn thinking_config(model: &str, effort: Effort) -> Option<Value> {
+    let level = effort.level()?;
+    let model = model.rsplit('/').next().unwrap_or(model);
+    Some(if model.starts_with("gemini-2") {
+        let budget = match effort {
+            Effort::Low => 1_024,
+            Effort::Medium => 4_096,
+            _ => 12_000,
+        };
+        json!({ "thinkingBudget": budget })
+    } else {
+        json!({ "thinkingLevel": level })
+    })
 }
 
 fn contents(conversation: &Conversation) -> Vec<Value> {
@@ -83,12 +151,25 @@ fn contents(conversation: &Conversation) -> Vec<Value> {
         .collect()
 }
 
+enum Round {
+    Done(StopReason),
+    /// The model called Cue's search tool; these are all the parts of its turn.
+    ToolCalls(Vec<Value>),
+}
+
+/// A part that is nothing but text, which can be merged with the text next to it.
+fn plain_text(part: &Value) -> Option<&str> {
+    let object = part.as_object()?;
+    (object.len() == 1).then(|| object.get("text")?.as_str())?
+}
+
 fn read_stream(
     body: &mut ureq::Body,
-    on_text: &mut dyn FnMut(&str) -> ControlFlow<()>,
-) -> Result<Completion, ProviderError> {
+    answer: &mut Answer<'_, '_, '_>,
+) -> Result<Round, ProviderError> {
     let mut usage = Usage::default();
     let mut stop = None;
+    let mut parts: Vec<Value> = Vec::new();
 
     for chunk in http::json_events(body) {
         let Some(chunk) = chunk? else { break };
@@ -97,10 +178,10 @@ fn read_stream(
         }
         // The whole prompt was blocked, so no candidates follow.
         if let Some(reason) = chunk["promptFeedback"]["blockReason"].as_str() {
-            return Ok(Completion {
-                stop: StopReason::Refusal(Some(format!("blocked: {reason}"))),
-                usage,
-            });
+            answer.add_usage(usage);
+            return Ok(Round::Done(StopReason::Refusal(Some(format!(
+                "blocked: {reason}"
+            )))));
         }
         let metadata = &chunk["usageMetadata"];
         if let Some(prompt) = metadata["promptTokenCount"].as_u64() {
@@ -113,19 +194,31 @@ fn read_stream(
         let Some(candidate) = chunk["candidates"].get(0) else {
             continue;
         };
-        let parts = candidate["content"]["parts"]
+        if let Some(queries) = candidate["groundingMetadata"]["webSearchQueries"].as_array() {
+            usage.web_searches = queries.len() as u32;
+        }
+        let new_parts = candidate["content"]["parts"]
             .as_array()
             .map(Vec::as_slice)
             .unwrap_or_default();
-        // Thought summaries are marked `thought: true`; only the answer is shown.
-        for part in parts.iter().filter(|part| part["thought"] != true) {
-            if let Some(text) = part["text"].as_str().filter(|text| !text.is_empty())
-                && on_text(text).is_break()
+        for part in new_parts {
+            // Thought summaries are marked `thought: true`; only the answer is shown.
+            if part["thought"] != true
+                && let Some(text) = part["text"].as_str()
+                && answer.text(text).is_break()
             {
-                return Ok(Completion {
-                    stop: StopReason::Cancelled,
-                    usage,
-                });
+                answer.add_usage(usage);
+                return Ok(Round::Done(StopReason::Cancelled));
+            }
+            // Text streams in many small parts; keep it as one part per run of text.
+            let last_is_text = parts.last().is_some_and(|last| plain_text(last).is_some());
+            match (plain_text(part), parts.last_mut()) {
+                (Some(text), Some(last)) if last_is_text => {
+                    if let Value::String(existing) = &mut last["text"] {
+                        existing.push_str(text);
+                    }
+                }
+                _ => parts.push(part.clone()),
             }
         }
         if let Some(reason) = candidate["finishReason"].as_str() {
@@ -139,15 +232,22 @@ fn read_stream(
         }
     }
 
-    stop.map(|stop| Completion { stop, usage })
-        .ok_or_else(|| ProviderError::Protocol("the stream ended without a finish reason".into()))
+    answer.add_usage(usage);
+    let stop = stop.ok_or_else(|| {
+        ProviderError::Protocol("the stream ended without a finish reason".into())
+    })?;
+    if stop == StopReason::EndTurn && parts.iter().any(|part| part.get("functionCall").is_some()) {
+        return Ok(Round::ToolCalls(parts));
+    }
+    Ok(Round::Done(stop))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::conversation::Turn;
-    use crate::providers::mock::{MockServer, Reply};
+    use crate::providers::Event;
+    use crate::providers::mock::{FakeSearch, MockServer, Reply};
 
     fn conversation() -> Conversation {
         Conversation {
@@ -183,18 +283,27 @@ mod tests {
         Reply::new(200, "text/event-stream", body)
     }
 
-    fn ask(client: &Gemini) -> (Result<Completion, ProviderError>, String) {
+    fn ask_with(
+        client: &Gemini,
+        model: &str,
+        options: Options<'_>,
+    ) -> (Result<Completion, ProviderError>, String) {
         let mut text = String::new();
-        let result = client.stream(
-            "gemini-3.5-flash",
-            Tier::Fast,
-            &conversation(),
-            &mut |piece| {
+        let result = client.stream(model, options, &conversation(), &mut |event| {
+            if let Event::Text(piece) = event {
                 text.push_str(piece);
-                ControlFlow::Continue(())
-            },
-        );
+            }
+            ControlFlow::Continue(())
+        });
         (result, text)
+    }
+
+    fn ask(client: &Gemini) -> (Result<Completion, ProviderError>, String) {
+        ask_with(client, "gemini-3.5-flash", Options::default())
+    }
+
+    fn body(request: &crate::providers::mock::Request) -> Value {
+        serde_json::from_str(&request.body).unwrap()
     }
 
     #[test]
@@ -214,7 +323,8 @@ mod tests {
                 stop: StopReason::EndTurn,
                 usage: Usage {
                     input_tokens: 1800,
-                    output_tokens: 52
+                    output_tokens: 52,
+                    web_searches: 0,
                 }
             }
         );
@@ -225,8 +335,10 @@ mod tests {
             "/v1beta/models/gemini-3.5-flash:streamGenerateContent?alt=sse"
         );
         assert_eq!(request.header("x-goog-api-key"), Some("g-test"));
-        let body: Value = serde_json::from_str(&request.body).unwrap();
+        let body = body(request);
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "be brief");
+        assert!(body["generationConfig"].get("thinkingConfig").is_none());
+        assert!(body.get("tools").is_none());
         let contents = body["contents"].as_array().unwrap();
         assert_eq!(
             contents[0]["parts"][0]["inlineData"],
@@ -241,6 +353,94 @@ mod tests {
             contents[2]["parts"].as_array().unwrap().len(),
             1,
             "image only on the first turn"
+        );
+    }
+
+    #[test]
+    fn sets_thinking_by_model_generation() {
+        assert_eq!(
+            thinking_config("gemini-3.5-flash", Effort::Medium),
+            Some(json!({ "thinkingLevel": "medium" }))
+        );
+        assert_eq!(
+            thinking_config("gemini-2.5-pro", Effort::Low),
+            Some(json!({ "thinkingBudget": 1024 }))
+        );
+        assert_eq!(thinking_config("gemini-4-argon", Effort::Default), None);
+    }
+
+    #[test]
+    fn grounds_with_google_search_and_counts_queries() {
+        let server = MockServer::start(vec![sse(&[
+            r#"{"candidates":[{"content":{"parts":[{"text":"It's in Limgrave."}]},"finishReason":"STOP","groundingMetadata":{"webSearchQueries":["a","b"]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}"#,
+        ])]);
+        let client = Gemini::new(format!("{}/v1beta/models", server.url), "g-test".into());
+
+        let options = Options {
+            effort: Effort::High,
+            search: Search::Provider,
+        };
+        let (result, text) = ask_with(&client, "gemini-3.5-flash", options);
+        assert_eq!(text, "It's in Limgrave.");
+        assert_eq!(result.unwrap().usage.web_searches, 2);
+        let body = body(&server.requests()[0]);
+        assert_eq!(body["tools"], json!([{ "google_search": {} }]));
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"],
+            json!({ "thinkingLevel": "high" })
+        );
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 16000);
+    }
+
+    #[test]
+    fn calls_the_search_tool_and_sends_signatures_back() {
+        let server = MockServer::start(vec![
+            sse(&[
+                r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"Let me "}]}}]}"#,
+                r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"check."}]}}]}"#,
+                r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"web_search","args":{"query":"terraria plantera"}},"thoughtSignature":"sig"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":50,"candidatesTokenCount":5}}"#,
+            ]),
+            sse(&[
+                r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"Break a bulb."}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":80,"candidatesTokenCount":4}}"#,
+            ]),
+        ]);
+        let client = Gemini::new(format!("{}/v1beta/models", server.url), "g-test".into());
+        let search = FakeSearch::new("1. Plantera's Bulb");
+
+        let options = Options {
+            search: Search::Tool(&search),
+            ..Options::default()
+        };
+        let (result, text) = ask_with(&client, "gemini-3.5-flash", options);
+        assert_eq!(text, "Let me check.\n\nBreak a bulb.");
+        assert_eq!(search.queries(), ["terraria plantera"]);
+        assert_eq!(
+            result.unwrap().usage,
+            Usage {
+                input_tokens: 130,
+                output_tokens: 9,
+                web_searches: 1,
+            }
+        );
+
+        let requests = server.requests();
+        assert_eq!(
+            body(&requests[0])["tools"][0]["functionDeclarations"][0]["name"],
+            "web_search"
+        );
+        let contents = body(&requests[1])["contents"].as_array().unwrap().clone();
+        assert_eq!(
+            contents[3],
+            json!({ "role": "model", "parts": [
+                { "text": "Let me check." },
+                { "functionCall": { "name": "web_search", "args": { "query": "terraria plantera" } }, "thoughtSignature": "sig" },
+            ] })
+        );
+        assert_eq!(
+            contents[4],
+            json!({ "role": "user", "parts": [{ "functionResponse": {
+                "name": "web_search", "response": { "result": "1. Plantera's Bulb" },
+            } }] })
         );
     }
 
