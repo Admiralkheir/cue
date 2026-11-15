@@ -45,7 +45,7 @@ base64 = "0.23"
 serde_json = "1"
 # Self-update: comparing release versions and checking downloads against SHA256SUMS.txt.
 semver = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 
 anyhow = "1"
 tracing = "0.1"
