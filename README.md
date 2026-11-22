@@ -71,5 +71,5 @@ development shortcuts.
 
 [MIT](LICENSE). Cue builds on many open-source crates; their licenses are collected with
 [cargo-about](https://github.com/EmbarkStudios/cargo-about) (`cargo about generate
-about.hbs --output-file THIRD_PARTY_LICENSES.html`), and CI publishes the result as an
-artifact.
+about.hbs --output-file THIRD_PARTY_LICENSES.html`), and every release package includes
+the result.

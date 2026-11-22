@@ -1,7 +1,7 @@
 name: Package
 
-# Builds the downloadable app for each platform. Called by CI on pushes to main and by
-# the release workflow; can also be started by hand.
+# Builds the downloadable app for each platform. Called by the release workflow; can also
+# be started by hand (Actions > Package > Run workflow) for a test build of any branch.
 on:
   workflow_call:
     secrets:

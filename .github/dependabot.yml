@@ -4,11 +4,18 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # One PR (and one CI run) a week for all crate updates instead of one per crate.
+    groups:
+      cargo:
+        patterns: ["*"]
     ignore:
       # gpui-kit pins an exact gpui-pre snapshot; these move together by hand.
       - dependency-name: gpui-pre-platform
