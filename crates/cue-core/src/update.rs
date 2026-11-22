@@ -376,7 +376,12 @@ fn download(agent: &ureq::Agent, url: &str, path: &Path) -> Result<String, Updat
     }
     file.sync_all()
         .map_err(io_error("couldn't save the download"))?;
-    Ok(format!("{:x}", hasher.finalize()))
+    // sha2 0.11's digest type no longer implements `LowerHex`, so spell out the bytes.
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn unpack(archive: &Path, into: &Path) -> Result<(), UpdateError> {
