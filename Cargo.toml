@@ -32,7 +32,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
-global-hotkey = "0.9"
+global-hotkey = "0.10"
 # The notification-area (Windows) and menu bar (macOS) icon. Without the default
 # libappindicator feature, so Linux builds need no extra GTK packages.
 tray-icon = { version = "0.26", default-features = false }
@@ -45,7 +45,7 @@ base64 = "0.23"
 serde_json = "1"
 # Self-update: comparing release versions and checking downloads against SHA256SUMS.txt.
 semver = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 
 anyhow = "1"
 tracing = "0.1"
