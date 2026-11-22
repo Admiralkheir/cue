@@ -27,9 +27,10 @@ cargo run -p cue-app
 - **Windows:** use the MSVC toolchain. Cue captures with Windows Graphics Capture.
 - **Linux (experimental):** run `scripts/install-linux-deps.sh` on Debian/Ubuntu first.
 
-Every push to `main` also builds downloadable packages for all three platforms (the
-`cue-macos`, `cue-windows` and `cue-linux` artifacts of the CI run), and tagging `vX.Y.Z`
-drafts a GitHub release with them.
+Tagging `vX.Y.Z` builds downloadable packages for all three platforms and drafts a
+GitHub release with them. For a test build of any branch, start the Package workflow by
+hand (Actions > Package > Run workflow); its `cue-macos`, `cue-windows` and `cue-linux`
+artifacts hold the packages.
 
 Each rebuilt development binary has a new code signature, so macOS asks for your login
 keychain password the first time it reads a stored API key.
